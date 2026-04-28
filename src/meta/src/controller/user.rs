@@ -17,18 +17,20 @@ use std::collections::{HashMap, HashSet};
 use itertools::Itertools;
 use risingwave_common::catalog::{DEFAULT_SUPER_USER, DEFAULT_SUPER_USER_FOR_PG};
 use risingwave_meta_model::object::ObjectType;
-use risingwave_meta_model::prelude::{Object, User, UserDefaultPrivilege, UserPrivilege};
+use risingwave_meta_model::prelude::{
+    Object, User, UserDefaultPrivilege, UserPrivilege, UserRoleMembership,
+};
 use risingwave_meta_model::user_privilege::Action;
 use risingwave_meta_model::{
     AuthInfo, DatabaseId, DefaultPrivilegeId, PrivilegeId, SchemaId, UserId, object, user,
-    user_default_privilege, user_privilege,
+    user_default_privilege, user_privilege, user_role_membership,
 };
 use risingwave_pb::common::PbObjectType;
 use risingwave_pb::meta::subscribe_response::{
     Info as NotificationInfo, Operation as NotificationOperation,
 };
 use risingwave_pb::user::update_user_request::PbUpdateField;
-use risingwave_pb::user::{PbAction, PbGrantPrivilege, PbUserInfo};
+use risingwave_pb::user::{PbAction, PbGrantPrivilege, PbRoleMembership, PbUserInfo};
 use sea_orm::ActiveValue::Set;
 use sea_orm::sea_query::{OnConflict, SimpleExpr, Value};
 use sea_orm::{
@@ -127,6 +129,9 @@ impl CatalogController {
             }
             PbUpdateField::Rename => user.name = Set(update_user.name.clone()),
             PbUpdateField::Admin => user.is_admin = Set(update_user.is_admin),
+            PbUpdateField::Inherit => {
+                user.can_inherit = Set(update_user.can_inherit.unwrap_or(true))
+            }
         });
 
         let user = user.update(&inner.db).await?;
@@ -140,6 +145,25 @@ impl CatalogController {
             .await;
 
         Ok(version)
+    }
+
+    pub async fn list_role_memberships(
+        &self,
+        member_ids: &[UserId],
+        include_all: bool,
+    ) -> MetaResult<Vec<PbRoleMembership>> {
+        let inner = self.inner.read().await;
+        let memberships = if include_all {
+            UserRoleMembership::find().all(&inner.db).await?
+        } else if member_ids.is_empty() {
+            vec![]
+        } else {
+            UserRoleMembership::find()
+                .filter(user_role_membership::Column::MemberId.is_in(member_ids.iter().copied()))
+                .all(&inner.db)
+                .await?
+        };
+        Ok(memberships.into_iter().map(Into::into).collect())
     }
 
     #[cfg(test)]
@@ -803,6 +827,8 @@ mod tests {
         mgr.create_user(make_test_user("test_user_2")).await?;
         let user_1 = mgr.get_user_by_name("test_user_1").await?;
         let user_2 = mgr.get_user_by_name("test_user_2").await?;
+        assert!(user_1.can_inherit);
+        assert!(user_2.can_inherit);
 
         assert!(
             mgr.create_user(make_test_user("test_user_1"))
@@ -992,6 +1018,55 @@ mod tests {
 
         mgr.drop_user(user_1.user_id).await?;
         mgr.drop_user(user_2.user_id).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_role_memberships_filters_and_requires_explicit_full_scan() -> MetaResult<()>
+    {
+        let mgr = CatalogController::new(MetaSrvEnv::for_test().await).await?;
+        mgr.create_user(make_test_user("role_a")).await?;
+        mgr.create_user(make_test_user("member_a")).await?;
+        mgr.create_user(make_test_user("grantor_a")).await?;
+        let role = mgr.get_user_by_name("role_a").await?;
+        let member = mgr.get_user_by_name("member_a").await?;
+        let grantor = mgr.get_user_by_name("grantor_a").await?;
+
+        {
+            let inner = mgr.inner.read().await;
+            user_role_membership::ActiveModel {
+                role_id: Set(role.user_id),
+                member_id: Set(member.user_id),
+                granted_by: Set(grantor.user_id),
+                admin_option: Set(false),
+                inherit_option: Set(true),
+                set_option: Set(true),
+                ..Default::default()
+            }
+            .insert(&inner.db)
+            .await?;
+        }
+
+        assert!(
+            mgr.list_role_memberships(&[], false).await?.is_empty(),
+            "filtered list should not treat an empty filter as a full scan"
+        );
+
+        let member_memberships = mgr.list_role_memberships(&[member.user_id], false).await?;
+        assert_eq!(member_memberships.len(), 1);
+        assert_eq!(member_memberships[0].role_id, role.user_id);
+        assert_eq!(member_memberships[0].member_id, member.user_id);
+        assert_eq!(member_memberships[0].granted_by, grantor.user_id);
+
+        assert!(
+            mgr.list_role_memberships(&[role.user_id], false)
+                .await?
+                .is_empty(),
+            "the filter should match member_id only"
+        );
+
+        let all_memberships = mgr.list_role_memberships(&[], true).await?;
+        assert_eq!(all_memberships.len(), 1);
         Ok(())
     }
 }
