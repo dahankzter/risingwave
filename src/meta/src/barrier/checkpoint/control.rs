@@ -995,7 +995,7 @@ impl DatabaseCheckpointControl {
                 Command::collect_commit_epoch_info(
                     &self.database_info,
                     &info,
-                    &mut task.commit_info,
+                    task,
                     resps_to_commit,
                     self.collect_backfill_pinned_upstream_log_epoch(),
                 );
@@ -1019,12 +1019,7 @@ impl DatabaseCheckpointControl {
         if !independent_jobs_task.is_empty() {
             let task = task.get_or_insert_default();
             for (job_id, epoch, resps, info) in independent_jobs_task {
-                collect_independent_job_commit_epoch_info(
-                    &mut task.commit_info,
-                    epoch,
-                    resps,
-                    &info,
-                );
+                collect_independent_job_commit_epoch_info(task, epoch, resps, &info);
                 task.epoch_infos
                     .try_insert(to_partial_graph_id(self.database_id, Some(job_id)), info)
                     .expect("non duplicate");
@@ -1091,6 +1086,16 @@ impl DatabaseCheckpointControl {
             let task = task.get_or_insert_default();
             task.refresh_finished_table_job_ids
                 .extend(refresh_finished_table_ids);
+        }
+
+        let iceberg_v3_sink_metadata = resps
+            .values()
+            .flat_map(|resp| resp.iceberg_v3_sink_metadata.clone())
+            .collect::<Vec<_>>();
+        if !iceberg_v3_sink_metadata.is_empty() {
+            let task = task.get_or_insert_default();
+            task.iceberg_v3_sink_metadata
+                .extend(iceberg_v3_sink_metadata);
         }
     }
 }
