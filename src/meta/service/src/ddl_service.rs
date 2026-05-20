@@ -143,6 +143,29 @@ impl DdlServiceImpl {
         streaming_job_resource_type::ResourceType::Regular(true)
     }
 
+    fn request_streaming_job_resource_type(
+        resource_type: Option<StreamingJobResourceType>,
+    ) -> streaming_job_resource_type::ResourceType {
+        resource_type
+            .and_then(|resource_type| resource_type.resource_type)
+            .unwrap_or_else(Self::default_streaming_job_resource_type)
+    }
+
+    fn reject_serverless_backfill_resource_type(
+        resource_type: &streaming_job_resource_type::ResourceType,
+        object_type: &str,
+    ) -> Result<(), Status> {
+        if matches!(
+            resource_type,
+            streaming_job_resource_type::ResourceType::ServerlessBackfillResourceGroup(_)
+        ) {
+            return Err(Status::invalid_argument(format!(
+                "ServerlessBackfillResourceGroup is not supported for CREATE {object_type}"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn start_migrate_table_fragments(&self) -> (JoinHandle<()>, Sender<()>) {
         tracing::info!("start migrate legacy table fragments task");
         let env = self.env.clone();
@@ -363,9 +386,19 @@ impl DdlService for DdlServiceImpl {
     ) -> Result<Response<CreateSourceResponse>, Status> {
         let req = request.into_inner();
         let source = req.get_source()?.clone();
+        let resource_type = Self::request_streaming_job_resource_type(req.resource_type);
+        Self::reject_serverless_backfill_resource_type(&resource_type, "SOURCE")?;
 
         match req.fragment_graph {
             None => {
+                if !matches!(
+                    resource_type,
+                    streaming_job_resource_type::ResourceType::Regular(_)
+                ) {
+                    return Err(Status::invalid_argument(
+                        "resource_group can only be specified for shared sources",
+                    ));
+                }
                 let version = self
                     .ddl_controller
                     .run_command(DdlCommand::CreateNonSharedSource(source))
@@ -384,7 +417,8 @@ impl DdlService for DdlServiceImpl {
                         stream_job,
                         fragment_graph,
                         dependencies: HashSet::new(),
-                        resource_type: Self::default_streaming_job_resource_type(),
+                        resource_type,
+                        serverless_backfill_resource_group: None,
                         if_not_exists: req.if_not_exists,
                         refresh_interval_sec: None,
                     })
@@ -450,6 +484,8 @@ impl DdlService for DdlServiceImpl {
         let sink = req.get_sink()?.clone();
         let fragment_graph = req.get_fragment_graph()?.clone();
         let dependencies = req.get_dependencies().iter().copied().collect();
+        let resource_type = Self::request_streaming_job_resource_type(req.resource_type);
+        Self::reject_serverless_backfill_resource_type(&resource_type, "SINK")?;
 
         let stream_job = StreamingJob::Sink(sink);
 
@@ -457,7 +493,8 @@ impl DdlService for DdlServiceImpl {
             stream_job,
             fragment_graph,
             dependencies,
-            resource_type: Self::default_streaming_job_resource_type(),
+            resource_type,
+            serverless_backfill_resource_group: None,
             if_not_exists: req.if_not_exists,
             refresh_interval_sec: None,
         };
@@ -542,7 +579,7 @@ impl DdlService for DdlServiceImpl {
         let mview = req.get_materialized_view()?.clone();
         let fragment_graph = req.get_fragment_graph()?.clone();
         let dependencies = req.get_dependencies().iter().copied().collect();
-        let resource_type = req.resource_type.unwrap().resource_type.unwrap();
+        let resource_type = Self::request_streaming_job_resource_type(req.resource_type);
 
         let stream_job = StreamingJob::MaterializedView(mview);
         let version = self
@@ -552,6 +589,10 @@ impl DdlService for DdlServiceImpl {
                 fragment_graph,
                 dependencies,
                 resource_type,
+                serverless_backfill_resource_group: (!req
+                    .serverless_backfill_resource_group
+                    .is_empty())
+                .then_some(req.serverless_backfill_resource_group),
                 if_not_exists: req.if_not_exists,
                 refresh_interval_sec: req.refresh_interval_sec,
             })
@@ -597,6 +638,8 @@ impl DdlService for DdlServiceImpl {
         let index = req.get_index()?.clone();
         let index_table = req.get_index_table()?.clone();
         let fragment_graph = req.get_fragment_graph()?.clone();
+        let resource_type = Self::request_streaming_job_resource_type(req.resource_type);
+        Self::reject_serverless_backfill_resource_type(&resource_type, "INDEX")?;
 
         let stream_job = StreamingJob::Index(index, index_table);
         let version = self
@@ -605,7 +648,8 @@ impl DdlService for DdlServiceImpl {
                 stream_job,
                 fragment_graph,
                 dependencies: HashSet::new(),
-                resource_type: Self::default_streaming_job_resource_type(),
+                resource_type,
+                serverless_backfill_resource_group: None,
                 if_not_exists: req.if_not_exists,
                 refresh_interval_sec: None,
             })
@@ -697,6 +741,7 @@ impl DdlService for DdlServiceImpl {
                 fragment_graph,
                 dependencies,
                 resource_type: Self::default_streaming_job_resource_type(),
+                serverless_backfill_resource_group: None,
                 if_not_exists: request.if_not_exists,
                 refresh_interval_sec: None,
             })
@@ -1676,6 +1721,7 @@ impl DdlService for DdlServiceImpl {
                 fragment_graph,
                 dependencies: HashSet::new(),
                 resource_type: Self::default_streaming_job_resource_type(),
+                serverless_backfill_resource_group: None,
                 if_not_exists,
                 refresh_interval_sec: None,
             })
@@ -1758,6 +1804,7 @@ impl DdlService for DdlServiceImpl {
                 fragment_graph,
                 dependencies,
                 resource_type: Self::default_streaming_job_resource_type(),
+                serverless_backfill_resource_group: None,
                 if_not_exists,
                 refresh_interval_sec: None,
             })
