@@ -90,8 +90,8 @@ pub use self::compaction_utils::{
 pub use self::task_progress::TaskProgress;
 use super::multi_builder::CapacitySplitTableBuilder;
 use super::{
-    GetObjectId, HummockResult, ObjectIdManager, SstableBuilderOptions, Xor8FilterBuilder,
-    Xor16FilterBuilder,
+    GetObjectId, HummockError, HummockResult, ObjectIdManager, SstableBuilderOptions,
+    Xor8FilterBuilder, Xor16FilterBuilder,
 };
 use crate::compaction_catalog_manager::{
     CompactionCatalogAgentRef, CompactionCatalogManager, CompactionCatalogManagerRef,
@@ -215,7 +215,7 @@ impl Compactor {
         let (split_table_outputs, table_stats_map) = {
             let factory = UnifiedSstableWriterFactory::new(self.context.sstable_store.clone());
             match (
-                self.task_config.sstable_filter_kind,
+                self.task_config.sstable_filter_type,
                 self.task_config.use_block_based_filter,
             ) {
                 (PbSstableFilterType::SstableFilterXor8, true) => {
@@ -266,7 +266,11 @@ impl Compactor {
                     .instrument_await("compact".verbose())
                     .await?
                 }
-                (kind, _) => unreachable!("unsupported sstable filter kind in compactor: {kind:?}"),
+                (filter_type, _) => {
+                    return Err(HummockError::other(format!(
+                        "unsupported sstable filter type in compactor: {filter_type:?}"
+                    )));
+                }
             }
         };
 

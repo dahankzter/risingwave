@@ -656,19 +656,19 @@ fn update_compaction_config(target: &mut CompactionConfig, items: &[MutableConfi
             MutableConfig::MaxVnodeKeyRangeBytes(c) => {
                 target.max_vnode_key_range_bytes = optional_positive_u64_config(*c);
             }
-            MutableConfig::SstableFilterKind(c) => {
-                if target.sstable_filter_kind.is_empty() {
-                    target.sstable_filter_kind =
+            MutableConfig::SstableFilterType(c) => {
+                if target.sstable_filter_type.is_empty() {
+                    target.sstable_filter_type =
                         vec!["xor16".to_owned(); target.max_level as usize + 1];
                 }
                 let idx = c.get_level() as usize;
-                let level_entry = target.sstable_filter_kind.get_mut(idx).ok_or_else(|| {
+                let level_entry = target.sstable_filter_type.get_mut(idx).ok_or_else(|| {
                     Error::CompactionGroup(format!(
-                        "sstable_filter_kind level {} is out of range",
+                        "sstable_filter_type level {} is out of range",
                         idx
                     ))
                 })?;
-                level_entry.clone_from(&c.filter_kind);
+                level_entry.clone_from(&c.filter_type);
             }
             MutableConfig::SstableFilterLayout(c) => {
                 if target.sstable_filter_layout.is_empty() {
@@ -799,7 +799,7 @@ mod tests {
     use risingwave_hummock_sdk::CompactionGroupId;
     use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::mutable_config::MutableConfig;
     use risingwave_pb::hummock::rise_ctl_update_compaction_config_request::{
-        CompressionAlgorithm, SstableFilterKind, SstableFilterLayout,
+        CompressionAlgorithm, SstableFilterLayout, SstableFilterType,
     };
 
     use crate::controller::SqlMetaStore;
@@ -811,24 +811,24 @@ mod tests {
     use crate::model::{Fragment, StreamJobFragments};
 
     #[test]
-    fn test_update_compaction_config_filter_kind_layout_backward_compat() {
+    fn test_update_compaction_config_filter_type_layout_backward_compat() {
         let mut config = CompactionConfigBuilder::new().build();
-        config.sstable_filter_kind.clear();
+        config.sstable_filter_type.clear();
         config.sstable_filter_layout.clear();
 
         super::update_compaction_config(
             &mut config,
-            &[MutableConfig::SstableFilterKind(SstableFilterKind {
+            &[MutableConfig::SstableFilterType(SstableFilterType {
                 level: 0,
-                filter_kind: "xor8".to_owned(),
+                filter_type: "xor8".to_owned(),
             })],
         )
         .unwrap();
         assert_eq!(
-            config.sstable_filter_kind.len(),
+            config.sstable_filter_type.len(),
             config.max_level as usize + 1
         );
-        assert_eq!(config.sstable_filter_kind[0], "xor8");
+        assert_eq!(config.sstable_filter_type[0], "xor8");
 
         super::update_compaction_config(
             &mut config,
@@ -853,9 +853,9 @@ mod tests {
         assert!(
             super::update_compaction_config(
                 &mut config,
-                &[MutableConfig::SstableFilterKind(SstableFilterKind {
+                &[MutableConfig::SstableFilterType(SstableFilterType {
                     level: oob,
-                    filter_kind: "xor8".to_owned(),
+                    filter_type: "xor8".to_owned(),
                 })],
             )
             .is_err()
