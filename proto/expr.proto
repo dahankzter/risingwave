@@ -380,6 +380,8 @@ message ExprNode {
 
     // EXTERNAL
     ICEBERG_TRANSFORM = 2201;
+    // INTERNAL — injected by planner only
+    RW_PACK_PK = 2202;
 
     // AI model functions
     OPENAI_EMBEDDING = 2501;

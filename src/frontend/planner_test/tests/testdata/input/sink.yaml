@@ -175,6 +175,7 @@
       primary_key = 'v1',
       write_mode = 'merge-on-read',
       format_version = '3',
+      create_table_if_not_exists = 'true',
       enable_pk_index = 'true'
     );
   expected_outputs:
@@ -197,6 +198,7 @@
       primary_key = 'v1',
       write_mode = 'merge-on-read',
       format_version = '3',
+      create_table_if_not_exists = 'true',
       enable_pk_index = 'true'
     );
   expected_outputs:
@@ -249,5 +251,119 @@
     create table sink_table (v1 date, v2 timestamp);
     explain create sink s into sink_table as select t1.v1, t2.v2 from t t1 join t t2 on t1.v1 = t2.v1
     with (type = 'append-only', force_append_only = 'true');
+  expected_outputs:
+    - explain_output
+- id: iceberg_v3_pk_index_sink_no_mismatch
+  sql: |
+    create table t1 (v1 int primary key, v2 bigint, v3 varchar, v4 time);
+    explain create sink s as select v1, v2, v3, v4 from t1 WITH (
+      connector = 'iceberg',
+      type = 'upsert',
+      catalog.type = 'mock',
+      catalog.name = 'demo',
+      database.name = 'demo_db',
+      table.name = 'sparse_table',
+      warehouse.path = 's3://icebergdata/demo',
+      s3.endpoint = 'http://127.0.0.1:9301',
+      s3.region = 'us-east-1',
+      s3.access.key = 'hummockadmin',
+      s3.secret.key = 'hummockadmin',
+      primary_key = 'v1',
+      write_mode = 'merge-on-read',
+      format_version = '3',
+      enable_pk_index = 'true'
+    );
+  expected_outputs:
+    - explain_output
+- id: iceberg_v3_pk_index_sink_visible_extra
+  sql: |
+    create table u (v1 int primary key, name varchar);
+    create table o (oid bigint primary key, v1 int, p varchar);
+    explain create sink s as select u.v1 as v1, o.oid as v2, u.name as v3, cast('00:00:00' as time) as v4 from u join o on u.v1 = o.v1 WITH (
+      connector = 'iceberg',
+      type = 'upsert',
+      catalog.type = 'mock',
+      catalog.name = 'demo',
+      database.name = 'demo_db',
+      table.name = 'sparse_table',
+      warehouse.path = 's3://icebergdata/demo',
+      s3.endpoint = 'http://127.0.0.1:9301',
+      s3.region = 'us-east-1',
+      s3.access.key = 'hummockadmin',
+      s3.secret.key = 'hummockadmin',
+      primary_key = 'v1',
+      write_mode = 'merge-on-read',
+      format_version = '3',
+      enable_pk_index = 'true'
+    );
+  expected_outputs:
+    - explain_output
+- id: iceberg_v3_pk_index_sink_hidden_extra
+  sql: |
+    create table pkless (v1 int, v2 bigint, v3 varchar, v4 time);
+    explain create sink s as select v1, v2, v3, v4 from pkless WITH (
+      connector = 'iceberg',
+      type = 'upsert',
+      catalog.type = 'mock',
+      catalog.name = 'demo',
+      database.name = 'demo_db',
+      table.name = 'sparse_table',
+      warehouse.path = 's3://icebergdata/demo',
+      s3.endpoint = 'http://127.0.0.1:9301',
+      s3.region = 'us-east-1',
+      s3.access.key = 'hummockadmin',
+      s3.secret.key = 'hummockadmin',
+      primary_key = 'v1',
+      write_mode = 'merge-on-read',
+      format_version = '3',
+      create_table_if_not_exists = 'true',
+      enable_pk_index = 'true'
+    );
+  expected_outputs:
+    - explain_output
+- id: iceberg_v3_pk_index_sink_mixed_extra
+  sql: |
+    create table pkless (v1 int, v2 bigint, v3 varchar, v4 time);
+    create table o (oid bigint primary key, v1 int);
+    explain create sink s as select pkless.v1 as v1, o.oid as v2, pkless.v3 as v3, pkless.v4 as v4 from pkless join o on pkless.v1 = o.v1 WITH (
+      connector = 'iceberg',
+      type = 'upsert',
+      catalog.type = 'mock',
+      catalog.name = 'demo',
+      database.name = 'demo_db',
+      table.name = 'sparse_table',
+      warehouse.path = 's3://icebergdata/demo',
+      s3.endpoint = 'http://127.0.0.1:9301',
+      s3.region = 'us-east-1',
+      s3.access.key = 'hummockadmin',
+      s3.secret.key = 'hummockadmin',
+      primary_key = 'v1',
+      write_mode = 'merge-on-read',
+      format_version = '3',
+      create_table_if_not_exists = 'true',
+      enable_pk_index = 'true'
+    );
+  expected_outputs:
+    - explain_output
+- id: iceberg_v3_pk_index_sink_auto_derived_pk
+  sql: |
+    create table t1 (v1 int primary key, v2 bigint, v3 varchar, v4 time);
+    explain create sink s as select v1, v2, v3, v4 from t1 WITH (
+      connector = 'iceberg',
+      type = 'upsert',
+      catalog.type = 'mock',
+      catalog.name = 'demo',
+      database.name = 'demo_db',
+      table.name = 'sparse_table',
+      warehouse.path = 's3://icebergdata/demo',
+      s3.endpoint = 'http://127.0.0.1:9301',
+      s3.region = 'us-east-1',
+      s3.access.key = 'hummockadmin',
+      s3.secret.key = 'hummockadmin',
+      write_mode = 'merge-on-read',
+      format_version = '3',
+      create_table_if_not_exists = 'true',
+      enable_pk_index = 'true'
+    );
   expected_outputs:
     - explain_output

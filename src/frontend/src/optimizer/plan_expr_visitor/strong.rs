@@ -357,6 +357,7 @@ impl Strong {
             | ExprType::RwFragmentVnodes
             | ExprType::RwActorVnodes
             | ExprType::IcebergTransform
+            | ExprType::RwPackPk
             | ExprType::HasTablePrivilege
             | ExprType::HasFunctionPrivilege
             | ExprType::HasAnyColumnPrivilege

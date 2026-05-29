@@ -333,6 +333,7 @@ impl ExprVisitor for ImpureAnalyzer {
             | Type::ConvertFrom
             | Type::ConvertTo
             | Type::IcebergTransform
+            | Type::RwPackPk
             | Type::InetNtoa
             | Type::InetAton
             | Type::QuoteLiteral

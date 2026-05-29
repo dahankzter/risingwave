@@ -89,7 +89,6 @@ where
     /// Buffer for accumulating delete position messages before the next barrier flush.
     delete_position_buffer: Option<DataChunkBuilder>,
     chunk_size: usize,
-    pk_matched: bool,
     sink_id: SinkId,
     local_barrier_manager: LocalBarrierManager,
 }
@@ -107,7 +106,6 @@ where
         pk_index_state_table: StateTable<S>,
         writer: W,
         chunk_size: usize,
-        pk_matched: bool,
         sink_id: SinkId,
         local_barrier_manager: LocalBarrierManager,
     ) -> Self {
@@ -119,7 +117,6 @@ where
             writer,
             delete_position_buffer: None,
             chunk_size,
-            pk_matched,
             sink_id,
             local_barrier_manager,
         }
@@ -189,15 +186,6 @@ where
         for record in chunk.records() {
             match record {
                 Record::Insert { new_row } => {
-                    if !self.pk_matched {
-                        let pk_row = new_row.project(&pk_indices);
-                        if let Some(chunk) = self
-                            .delete_existing_row(pk_row, &mut delete_position_buffer)
-                            .await?
-                        {
-                            yield chunk;
-                        }
-                    }
                     let overflow = insert_chunk.append_one_row(new_row);
                     debug_assert!(overflow.is_none(), "insert chunk exceeds capacity");
                     insert_pks.push(new_row.project(&pk_indices));
@@ -458,7 +446,6 @@ mod tests {
                 state_table,
                 writer,
                 CHUNK_SIZE,
-                true,
                 SinkId::new(0),
                 lbm,
             )

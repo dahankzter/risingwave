@@ -97,11 +97,6 @@ impl ExecutorBuilder for IcebergWithPkIndexWriterExecutorBuilder {
             streaming_config: params.config.as_ref().clone(),
         };
         let writer = IcebergWriterImpl::build(&config, table, &writer_param)?;
-        let pk_matched = params
-            .info
-            .stream_key
-            .iter()
-            .all(|i| pk_indices.contains(i));
 
         let exec = WriterExecutor::new(
             params.actor_context,
@@ -110,7 +105,6 @@ impl ExecutorBuilder for IcebergWithPkIndexWriterExecutorBuilder {
             pk_index_state_table,
             writer,
             params.config.developer.chunk_size,
-            pk_matched,
             sink_id,
             params.local_barrier_manager.clone(),
         );

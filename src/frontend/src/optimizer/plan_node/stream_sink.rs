@@ -19,7 +19,8 @@ use iceberg::spec::Transform;
 use itertools::Itertools;
 use pretty_xmlish::{Pretty, XmlNode};
 use risingwave_common::catalog::{
-    ColumnCatalog, CreateType, FieldLike, RISINGWAVE_ICEBERG_ROW_ID, ROW_ID_COLUMN_NAME,
+    ColumnCatalog, ColumnDesc, ColumnId, CreateType, FieldLike, RISINGWAVE_ICEBERG_ROW_ID,
+    ROW_ID_COLUMN_NAME,
 };
 use risingwave_common::types::{DataType, StructType};
 use risingwave_common::util::iter_util::ZipEqDebug;
@@ -283,7 +284,7 @@ impl StreamSink {
         target_table: Option<Arc<TableCatalog>>,
         target_table_mapping: Option<Vec<Option<usize>>>,
         definition: String,
-        properties: WithOptionsSecResolved,
+        mut properties: WithOptionsSecResolved,
         format_desc: Option<SinkFormatDesc>,
         partition_info: Option<PartitionComputeInfo>,
         auto_refresh_schema_from_table: Option<Arc<TableCatalog>>,
@@ -336,15 +337,17 @@ impl StreamSink {
                         .try_collect::<_, _, RwError>()?)
                 }
             } else if properties.get(CREATE_TABLE_IF_NOT_EXISTS) == Some(&"true".to_owned())
-                && sink_type == SinkType::Upsert
+                && !sink_type.is_append_only()
                 && downstream_pk.is_none()
             {
                 Some(derived_pk.clone())
             } else if properties.is_iceberg_connector()
-                && sink_type == SinkType::Upsert
+                && !sink_type.is_append_only()
                 && downstream_pk.is_none()
             {
                 // If user doesn't specify the downstream primary key, we use the stream key as the pk.
+                // (Iceberg's `type='upsert'` is normalised to `Retract` by `derive_sink_type`, so we
+                // accept both Upsert and Retract here.)
                 Some(derived_pk.clone())
             } else {
                 downstream_pk
@@ -408,6 +411,67 @@ impl StreamSink {
                 }
             }
         }
+        // For Iceberg V3 pk-index sinks: extend downstream_pk to the full upstream stream
+        // key by packing hidden extras into a `_rw_extra_pk: Bytea` column. This must run
+        // BEFORE derive_iceberg_sink_distribution so that the partition col, if any, is
+        // appended on top of the extended schema rather than between user cols and our
+        // synthetic col.
+        let mut sink_columns = columns;
+        let mut downstream_pk = downstream_pk;
+        let mut emit_pk_extension_notice: Option<(String, bool)> = None;
+        if properties.is_iceberg_connector()
+            && properties
+                .get(ENABLE_PK_INDEX)
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            && let Some(user_pk) = downstream_pk.as_ref().cloned()
+        {
+            let (new_input, new_pk, new_columns) =
+                derive_iceberg_pk_index_pk_and_input(input.clone(), &user_pk, &sink_columns)?;
+            let mismatch = new_pk.len() != user_pk.len();
+            let pk_names = new_pk
+                .iter()
+                .map(|&i| new_columns[i].name().to_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            // Detect whether the helper added a synthetic `_rw_extra_pk` column.
+            let added_extra_pk = new_columns
+                .last()
+                .map(|c| c.name() == "_rw_extra_pk")
+                .unwrap_or(false)
+                && new_pk.last().copied() == Some(new_columns.len() - 1);
+
+            // §9.7 guardrail: derive-mode requires `create_table_if_not_exists='true'`.
+            // We need to add a synthetic `_rw_extra_pk` column to the iceberg table, which
+            // is only possible at table-creation time. Sinking into an existing iceberg
+            // table would silently drop the column and corrupt the pk index.
+            if added_extra_pk
+                && properties
+                    .get(CREATE_TABLE_IF_NOT_EXISTS)
+                    .map(|v| v.as_str())
+                    != Some("true")
+            {
+                return Err(ErrorCode::InvalidInputSyntax(
+                    "Iceberg V3 sink with `enable_pk_index='true'` requires `create_table_if_not_exists='true'` \
+                     because the planner needs to add a synthetic `_rw_extra_pk` column to the iceberg table. \
+                     Existing iceberg tables cannot be extended in-place by this sink."
+                        .to_owned(),
+                )
+                .into());
+            }
+
+            if mismatch {
+                emit_pk_extension_notice = Some((pk_names.clone(), added_extra_pk));
+            }
+            // Always sync properties["primary_key"] so the iceberg connector's validation
+            // (which reads the WITH option, not downstream_pk) sees the effective pk. This
+            // also covers the case where the user omitted `primary_key` and the planner
+            // auto-derived it from the upstream stream key.
+            properties.insert(DOWNSTREAM_PK_KEY.to_owned(), pk_names);
+            input = new_input;
+            sink_columns = new_columns;
+            downstream_pk = Some(new_pk);
+        }
+
         let mut extra_partition_col_idx = None;
 
         let required_dist = match input.distribution() {
@@ -426,15 +490,25 @@ impl StreamSink {
                         RequiredDist::hash_shard(downstream_pk)
                     }
                     Some(s) if s == ICEBERG_SINK => {
-                        let (required_dist, new_input, partition_col_idx) =
+                        let (default_dist, new_input, partition_col_idx) =
                             Self::derive_iceberg_sink_distribution(
                                 input,
                                 partition_info,
-                                &columns,
+                                &sink_columns,
                             )?;
                         input = new_input;
                         extra_partition_col_idx = partition_col_idx;
-                        required_dist
+                        // V3 pk-index sinks require pk-locality so state-table lookups are local.
+                        // Override the partition-col shuffle in that case; partition co-location is
+                        // intentionally sacrificed (compaction handles file count).
+                        let is_pk_index = properties
+                            .get(ENABLE_PK_INDEX)
+                            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+                        if is_pk_index && let Some(pk) = &downstream_pk {
+                            RequiredDist::shard_by_key(input.schema().len(), pk)
+                        } else {
+                            default_dist
+                        }
                     }
                     _ => {
                         assert_matches!(user_distributed_by, RequiredDist::Any);
@@ -480,7 +554,7 @@ impl StreamSink {
             db_name,
             sink_from_name: sink_from_table_name,
             definition,
-            columns,
+            columns: sink_columns,
             plan_pk: pk,
             downstream_pk,
             distribution_key,
@@ -580,7 +654,20 @@ impl StreamSink {
             input
         };
 
-        Ok(Self::new(input, sink_desc, log_store_type))
+        let sink = Self::new(input, sink_desc, log_store_type);
+        if let Some((pk_names, added_extra_pk)) = emit_pk_extension_notice {
+            let extra_pk_hint = if added_extra_pk {
+                " A hidden column `_rw_extra_pk` (memcmp-packed) was added to disambiguate rows."
+            } else {
+                ""
+            };
+            sink.base.ctx().session_ctx().notice_to_user(format!(
+                "Iceberg V3 sink `{}`: upstream stream key contains columns not in user-specified primary key. \
+                 Extending iceberg primary key to ({}) to preserve all upstream rows.{}",
+                sink.sink_desc.name, pk_names, extra_pk_hint,
+            ));
+        }
+        Ok(sink)
     }
 
     fn sink_type_in_prop(properties: &WithOptionsSecResolved) -> Result<Option<SinkType>> {
@@ -785,6 +872,92 @@ pub fn is_iceberg_with_pk_index_sink(sink_desc: &SinkDesc) -> Result<bool> {
         .get(ENABLE_PK_INDEX)
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
     Ok(res)
+}
+
+/// For Iceberg V3 pk-index sinks where `upstream stream_key ⊄ user_pk`, build a new
+/// input plan and `downstream_pk` that uses the full stream key as the iceberg primary key.
+///
+/// "Extras" = upstream stream-key columns that are not in the user-declared primary key.
+/// We split them by whether the sink writes the column out to iceberg:
+///
+/// - **Visible extra** (`!columns[i].is_hidden`): the column is part of the sink output
+///   (it appears in `param.columns` after `build_sink_param` filters by `!is_hidden`), so we
+///   simply append its index to `downstream_pk`. The iceberg table gains it as a pk column;
+///   no new column is needed.
+/// - **Hidden extra** (`columns[i].is_hidden`): the column exists in the upstream plan
+///   (e.g., a stream-key column the user did not `SELECT`, or a RisingWave-internal column
+///   such as `_row_id`) but is NOT written to iceberg. We cannot reference it from iceberg
+///   directly, so all such columns are memcmp-packed into a single synthetic
+///   `_rw_extra_pk: Bytea` column via a `StreamProject` and `_rw_pack_pk(...)` call.
+///
+/// Returns `(new_input, new_downstream_pk, new_columns)`.
+/// When no extras exist, this is the identity transform (input/pk/columns unchanged).
+/// Callers can detect whether a synthetic `_rw_extra_pk` column was added by checking
+/// whether the last entry in `new_columns` is named `_rw_extra_pk`.
+fn derive_iceberg_pk_index_pk_and_input(
+    input: PlanRef,
+    user_pk: &[usize],
+    columns: &[ColumnCatalog],
+) -> Result<(PlanRef, Vec<usize>, Vec<ColumnCatalog>)> {
+    // Local alias to avoid colliding with the file-level `Type` (expr_node::Type) import.
+    use risingwave_pb::expr::expr_node::Type as ExprType;
+
+    let stream_key = input.expect_stream_key();
+    let extras: Vec<usize> = stream_key
+        .iter()
+        .copied()
+        .filter(|i| !user_pk.contains(i))
+        .collect();
+
+    if extras.is_empty() {
+        return Ok((input, user_pk.to_vec(), columns.to_vec()));
+    }
+
+    let (visible_extras, hidden_extras): (Vec<usize>, Vec<usize>) =
+        extras.iter().copied().partition(|&i| !columns[i].is_hidden);
+
+    let (new_input, new_columns, added_extra_pk_col) = if hidden_extras.is_empty() {
+        (input, columns.to_vec(), false)
+    } else {
+        // Build Project: identity refs + _rw_pack_pk(hidden_extras...).
+        let fields = input.schema().fields();
+        let mut exprs: Vec<ExprImpl> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, f)| InputRef::new(i, f.data_type.clone()).into())
+            .collect();
+        let pack_args: Vec<ExprImpl> = hidden_extras
+            .iter()
+            .map(|&i| InputRef::new(i, fields[i].data_type.clone()).into())
+            .collect();
+        let pack =
+            FunctionCall::new_unchecked(ExprType::RwPackPk, pack_args, DataType::Bytea).into();
+        exprs.push(pack);
+
+        let project = StreamProject::new(generic::Project::new(exprs, input));
+
+        let mut new_columns = columns.to_vec();
+        let next_id = new_columns
+            .iter()
+            .map(|c| c.column_id().get_id())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
+        new_columns.push(ColumnCatalog {
+            column_desc: ColumnDesc::named("_rw_extra_pk", ColumnId::new(next_id), DataType::Bytea),
+            is_hidden: false,
+        });
+        (project.into(), new_columns, true)
+    };
+
+    let mut new_pk = user_pk.to_vec();
+    new_pk.extend(visible_extras);
+    if added_extra_pk_col {
+        // _rw_extra_pk is always the last column we added.
+        new_pk.push(new_columns.len() - 1);
+    }
+
+    Ok((new_input, new_pk, new_columns))
 }
 
 impl PlanTreeNodeUnary<Stream> for StreamSink {

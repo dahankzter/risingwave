@@ -79,6 +79,7 @@ pub mod regexp;
 mod repeat;
 mod replace;
 mod round;
+mod rw_pack_pk;
 mod sha;
 mod similar_to_escape;
 mod split_part;
