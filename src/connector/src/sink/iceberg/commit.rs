@@ -40,7 +40,7 @@ use tokio_retry::strategy::{ExponentialBackoff, jitter};
 use tracing::warn;
 
 use super::{GLOBAL_SINK_METRICS, IcebergConfig, SinkError, commit_branch};
-use crate::connector_common::IcebergSinkCompactionUpdate;
+use crate::connector_common::{IcebergCommittedSnapshot, IcebergSinkCompactionUpdate};
 use crate::sink::catalog::SinkId;
 use crate::sink::{Result, SinglePhaseCommitCoordinator, SinkParam, TwoPhaseCommitCoordinator};
 
@@ -237,6 +237,18 @@ pub struct IcebergSinkCommitter {
 }
 
 impl IcebergSinkCommitter {
+    fn latest_committed_snapshot(&self) -> Option<IcebergCommittedSnapshot> {
+        let branch = commit_branch(self.config.r#type.as_str(), self.config.write_mode);
+        self.table
+            .metadata()
+            .snapshot_for_ref(&branch)
+            .map(|snapshot| IcebergCommittedSnapshot {
+                branch,
+                snapshot_id: snapshot.snapshot_id(),
+                timestamp_ms: snapshot.timestamp_ms(),
+            })
+    }
+
     // Reload table and guarantee current schema_id and partition_spec_id matches
     // given `schema_id` and `partition_spec_id`
     async fn reload_table(
@@ -620,6 +632,7 @@ impl IcebergSinkCommitter {
                 .send(IcebergSinkCompactionUpdate {
                     sink_id: self.sink_id,
                     force_compaction: false,
+                    committed_snapshot: self.latest_committed_snapshot(),
                 })
                 .is_err()
         {
@@ -867,6 +880,7 @@ impl IcebergSinkCommitter {
                         .send(IcebergSinkCompactionUpdate {
                             sink_id: self.sink_id,
                             force_compaction: true,
+                            committed_snapshot: None,
                         })
                         .is_err()
                 {

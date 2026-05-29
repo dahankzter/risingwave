@@ -14,6 +14,7 @@
 
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use itertools::Itertools;
+use risingwave_connector::connector_common::IcebergCommittedSnapshot;
 use risingwave_connector::sink::SinkError;
 use risingwave_connector::sink::catalog::SinkId;
 use thiserror_ext::AsReport;
@@ -21,6 +22,74 @@ use tokio::sync::oneshot::Sender;
 use tokio::task::JoinHandle;
 
 use super::*;
+
+#[derive(Debug, Clone)]
+pub(super) enum SnapshotExpirationProtection {
+    NoProtection,
+    Skip,
+    Watermark(IcebergCommittedSnapshot),
+}
+
+impl SnapshotExpirationProtection {
+    fn protect_with(&mut self, snapshot: Option<&IcebergCommittedSnapshot>) {
+        let Some(snapshot) = snapshot else {
+            *self = Self::Skip;
+            return;
+        };
+
+        if matches!(self, Self::Skip) {
+            return;
+        }
+
+        match self {
+            Self::NoProtection => {
+                *self = Self::Watermark(snapshot.clone());
+            }
+            Self::Watermark(existing) => {
+                if snapshot.timestamp_ms < existing.timestamp_ms {
+                    *existing = snapshot.clone();
+                }
+            }
+            Self::Skip => {}
+        }
+    }
+}
+
+impl IcebergCompactionManagerInner {
+    pub(super) fn begin_snapshot_expiration(
+        &mut self,
+        sink_id: SinkId,
+    ) -> Option<SnapshotExpirationProtection> {
+        if !self
+            .snapshot_expiration_in_progress_sink_ids
+            .insert(sink_id)
+        {
+            return None;
+        }
+
+        Some(self.snapshot_expiration_protection(sink_id))
+    }
+
+    pub(super) fn finish_snapshot_expiration(&mut self, sink_id: SinkId) {
+        self.snapshot_expiration_in_progress_sink_ids
+            .remove(&sink_id);
+    }
+
+    pub(super) fn snapshot_expiration_protection(
+        &self,
+        sink_id: SinkId,
+    ) -> SnapshotExpirationProtection {
+        let mut protection = SnapshotExpirationProtection::NoProtection;
+
+        if let Some(track) = self.sink_schedules.get(&sink_id)
+            && let Some(gc_watermark_snapshot) = track.processing_gc_watermark_snapshot()
+        {
+            protection.protect_with(gc_watermark_snapshot);
+        }
+
+        protection
+    }
+}
 
 impl IcebergCompactionManager {
     pub fn gc_loop(manager: Arc<Self>, interval_sec: u64) -> (JoinHandle<()>, Sender<()>) {
@@ -87,6 +156,58 @@ impl IcebergCompactionManager {
             return Ok(());
         }
 
+        let default_snapshot_expiration_timestamp_ms = now - MAX_SNAPSHOT_AGE_MS_DEFAULT;
+
+        let mut snapshot_expiration_timestamp_ms =
+            match iceberg_config.snapshot_expiration_timestamp_ms(now) {
+                Some(timestamp) => timestamp,
+                None => default_snapshot_expiration_timestamp_ms,
+            };
+
+        let Some(snapshot_expiration_protection) =
+            self.inner.write().begin_snapshot_expiration(sink_id)
+        else {
+            tracing::info!(
+                catalog_name = iceberg_config.catalog_name(),
+                table_name = iceberg_config.full_table_name()?.to_string(),
+                %sink_id,
+                "Skip snapshots expiration because another expiration is in progress",
+            );
+            return Ok(());
+        };
+        let _snapshot_expiration_guard = scopeguard::guard(self.inner.clone(), move |inner| {
+            inner.write().finish_snapshot_expiration(sink_id);
+        });
+
+        match snapshot_expiration_protection {
+            SnapshotExpirationProtection::NoProtection => {}
+            SnapshotExpirationProtection::Skip => {
+                tracing::info!(
+                    catalog_name = iceberg_config.catalog_name(),
+                    table_name = iceberg_config.full_table_name()?.to_string(),
+                    %sink_id,
+                    "Skip snapshots expiration because an iceberg compaction task has no observed GC watermark",
+                );
+                return Ok(());
+            }
+            SnapshotExpirationProtection::Watermark(snapshot) => {
+                let original_snapshot_expiration_timestamp_ms = snapshot_expiration_timestamp_ms;
+                snapshot_expiration_timestamp_ms =
+                    snapshot_expiration_timestamp_ms.min(snapshot.timestamp_ms);
+                tracing::info!(
+                    catalog_name = iceberg_config.catalog_name(),
+                    table_name = iceberg_config.full_table_name()?.to_string(),
+                    %sink_id,
+                    gc_watermark_branch = %snapshot.branch,
+                    gc_watermark_snapshot_id = snapshot.snapshot_id,
+                    gc_watermark_timestamp_ms = snapshot.timestamp_ms,
+                    original_snapshot_expiration_timestamp_ms,
+                    protected_snapshot_expiration_timestamp_ms = snapshot_expiration_timestamp_ms,
+                    "Protect snapshots expiration with iceberg compaction GC watermark",
+                );
+            }
+        }
+
         let catalog = iceberg_config.create_catalog().await?;
         let mut table = catalog
             .load_table(&iceberg_config.full_table_name()?)
@@ -94,19 +215,11 @@ impl IcebergCompactionManager {
             .map_err(|e| SinkError::Iceberg(e.into()))?;
 
         let metadata = table.metadata();
-        let mut snapshots = metadata.snapshots().collect_vec();
-        snapshots.sort_by_key(|s| s.timestamp_ms());
+        let snapshots = metadata.snapshots().collect_vec();
 
-        let default_snapshot_expiration_timestamp_ms = now - MAX_SNAPSHOT_AGE_MS_DEFAULT;
-
-        let snapshot_expiration_timestamp_ms =
-            match iceberg_config.snapshot_expiration_timestamp_ms(now) {
-                Some(timestamp) => timestamp,
-                None => default_snapshot_expiration_timestamp_ms,
-            };
-
-        if snapshots.is_empty()
-            || snapshots.first().unwrap().timestamp_ms() > snapshot_expiration_timestamp_ms
+        if !snapshots
+            .iter()
+            .any(|snapshot| snapshot.timestamp_ms() < snapshot_expiration_timestamp_ms)
         {
             return Ok(());
         }

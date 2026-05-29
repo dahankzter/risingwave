@@ -65,6 +65,7 @@ pub struct IcebergCompactionManager {
 struct IcebergCompactionManagerInner {
     sink_schedules: HashMap<SinkId, CompactionTrack>,
     snapshot_expiration_sink_ids: HashSet<SinkId>,
+    snapshot_expiration_in_progress_sink_ids: HashSet<SinkId>,
     manual_compaction_waiters: HashMap<SinkId, ManualCompactionWaiter>,
 }
 
@@ -91,6 +92,7 @@ impl IcebergCompactionManager {
                 inner: Arc::new(RwLock::new(IcebergCompactionManagerInner {
                     sink_schedules: HashMap::default(),
                     snapshot_expiration_sink_ids: HashSet::default(),
+                    snapshot_expiration_in_progress_sink_ids: HashSet::default(),
                     manual_compaction_waiters: HashMap::default(),
                 })),
                 metadata_manager,
