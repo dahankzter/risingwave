@@ -95,13 +95,21 @@ fn alter_prost_user_info(
                 user_info.can_create_db = false;
                 update_fields.insert(UpdateField::CreateDb);
             }
-            UserOption::CreateUser => {
+            UserOption::CreateRole | UserOption::CreateUser => {
                 user_info.can_create_user = true;
                 update_fields.insert(UpdateField::CreateUser);
             }
-            UserOption::NoCreateUser => {
+            UserOption::NoCreateRole | UserOption::NoCreateUser => {
                 user_info.can_create_user = false;
                 update_fields.insert(UpdateField::CreateUser);
+            }
+            UserOption::Inherit => {
+                user_info.can_inherit = Some(true);
+                update_fields.insert(UpdateField::Inherit);
+            }
+            UserOption::NoInherit => {
+                user_info.can_inherit = Some(false);
+                update_fields.insert(UpdateField::Inherit);
             }
             UserOption::Login => {
                 user_info.can_login = true;
@@ -118,15 +126,6 @@ fn alter_prost_user_info(
             UserOption::NoAdmin => {
                 user_info.is_admin = false;
                 update_fields.insert(UpdateField::Admin);
-            }
-            UserOption::CreateRole
-            | UserOption::NoCreateRole
-            | UserOption::Inherit
-            | UserOption::NoInherit => {
-                return Err(ErrorCode::InvalidParameterValue(
-                    "role options are not supported yet".to_owned(),
-                )
-                .into());
             }
             UserOption::EncryptedPassword(p) => {
                 if !p.0.is_empty() {
@@ -253,6 +252,13 @@ pub async fn handle_alter_user(
     Ok(response_builder.into())
 }
 
+pub async fn handle_alter_role(
+    handler_args: HandlerArgs,
+    stmt: AlterUserStatement,
+) -> Result<RwPgResponse> {
+    handle_alter_user(handler_args, stmt).await
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -309,21 +315,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_alter_user_rejects_role_options() {
+    async fn test_alter_user_accepts_role_options() {
         let frontend = LocalFrontend::new(Default::default()).await;
+        let session = frontend.session_ref();
+        let user_info_reader = session.env().user_info_reader();
+
         frontend
             .run_sql("CREATE USER role_option_user")
             .await
             .unwrap();
 
-        for option in ["CREATEROLE", "NOCREATEROLE", "INHERIT", "NOINHERIT"] {
-            let err = frontend
-                .run_sql(&format!("ALTER USER role_option_user WITH {option}"))
-                .await
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("role options are not supported yet"), "{err}");
-        }
+        frontend
+            .run_sql("ALTER USER role_option_user WITH CREATEROLE NOINHERIT")
+            .await
+            .unwrap();
+
+        let user = user_info_reader
+            .read_guard()
+            .get_user_by_name("role_option_user")
+            .cloned()
+            .unwrap();
+        assert!(user.can_create_user);
+        assert!(!user.can_inherit);
+
+        frontend
+            .run_sql("ALTER USER role_option_user WITH NOCREATEROLE INHERIT")
+            .await
+            .unwrap();
+
+        let user = user_info_reader
+            .read_guard()
+            .get_user_by_name("role_option_user")
+            .cloned()
+            .unwrap();
+        assert!(!user.can_create_user);
+        assert!(user.can_inherit);
     }
 
     #[tokio::test]
