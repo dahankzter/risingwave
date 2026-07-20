@@ -579,6 +579,69 @@ async fn build_match_row(
         .into_owned_row())
 }
 
+/// Compute one partition's emit-on-update changelog: refresh its matcher over the *whole* buffer
+/// (in emit-on-update the match window is all data-so-far — "as if input ended now" — not the
+/// watermark-safe prefix), rebuild every provisional match's output row, diff against the
+/// last-emitted base, and advance the base to the new set. Returns the `Delete`/`Insert` ops for
+/// the caller to stream — a plain async fn cannot `yield` — while updating `last_emitted` and the
+/// cached matcher in place. `rows` is the partition's buffer, already read by the caller, and must
+/// be non-empty (the caller handles the drained-partition case, where there is nothing to diff).
+///
+/// Shared by two callers so they produce byte-identical output and stay in lockstep:
+/// * the barrier arm — the normal emit-on-update path, diffing every dirty partition before commit;
+/// * the watermark arm's emit-before-finalize — which runs this first, before eviction removes any
+///   rows, to close the never-emitted-match hole (see that call site).
+///
+/// The diff is deterministic in the buffer content, so running it twice with no intervening change
+/// (watermark then barrier) is a no-op the second time: the extra call only reorders the same ops
+/// earlier within the epoch, never changing what is emitted.
+///
+/// `inc` is the partition's cached matcher, resolved by the caller (`matchers.entry(..)`); the
+/// helper refreshes it over the whole buffer and leaves it there.
+async fn emit_partition_diff(
+    inc: &mut IncrementalMatcher,
+    last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
+    partition_key: &OwnedRow,
+    rows: &[BufferedRow],
+    defines: &HashMap<String, CompiledDefine>,
+    within: Option<&NonStrictExpression>,
+    measures: &[CompiledMeasure],
+) -> StreamExecutorResult<Vec<(Op, OwnedRow)>> {
+    // In emit-on-update the whole buffer is the match window.
+    let safe_len = rows.len();
+    let matcher = DefineMatcher {
+        rows,
+        safe_len,
+        defines,
+        within,
+    };
+    refresh_matcher(inc, rows, safe_len, &matcher).await?;
+
+    // Rebuild the current provisional set as `(match, output row)`, mapping each seq-anchored match
+    // back to its buffer position for measure evaluation.
+    let mut seq_to_pos: HashMap<i64, usize> = HashMap::with_capacity(safe_len);
+    for (p, r) in rows.iter().enumerate() {
+        seq_to_pos.insert(r.seq, p);
+    }
+    let mut new_emitted: Vec<(SeqMatch, OwnedRow)> = Vec::with_capacity(inc.provisional().len());
+    for m in inc.provisional() {
+        let start = seq_to_pos[&m.start_seq];
+        let out_row = build_match_row(measures, rows, partition_key, start, &m.labels).await?;
+        new_emitted.push((m.clone(), out_row));
+    }
+
+    // Diff the current provisional set against the diff base, then advance the base to it.
+    let ops = {
+        let prev = last_emitted
+            .get(partition_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        diff_provisional(prev, &new_emitted)
+    };
+    last_emitted.insert(partition_key.clone(), new_emitted);
+    Ok(ops)
+}
+
 pub struct MatchRecognizeExecutorArgs<S: StateStore> {
     pub ctx: ActorContextRef,
     pub input: Executor,
@@ -876,7 +939,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
         // re-diffs exactly those. `last_emitted` is the diff base: per partition, the `(match,
         // output row)` set we last told downstream is live, so a Delete can re-emit the exact prior
         // row. Both are in-memory derivations cleared on a vnode-bitmap change (like `matchers`); a
-        // later task persists/rebuilds `last_emitted` so recovery/rescale does not re-emit (Task 7).
+        // later task persists/rebuilds `last_emitted` so recovery/rescale does not re-emit.
         let mut dirty_partitions: HashSet<OwnedRow> = HashSet::new();
         let mut last_emitted: HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>> = HashMap::new();
 
@@ -1105,6 +1168,55 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 );
                                 matchers.remove(&partition_key);
                                 continue;
+                            }
+
+                            // Emit-on-update: close the never-emitted-match hole before evicting.
+                            // Within an epoch the message order is Chunk -> Watermark -> Barrier. A
+                            // complete match whose rows arrived *this* epoch and become
+                            // watermark-safe now is about to be evicted below — but no barrier has
+                            // diffed this partition yet, so its `Insert` was never emitted, and the
+                            // barrier that follows sees the rows already gone (nothing to diff).
+                            // Downstream would permanently miss a real match. So run the same
+                            // whole-buffer diff the barrier arm runs FIRST, guaranteeing every match
+                            // finalization removes from the diffable set has been emitted before its
+                            // rows leave. EMIT ON WINDOW CLOSE is immune (it emits at the watermark),
+                            // hence the `emit_on_update` gate.
+                            //
+                            // Gated on the partition being dirty: only a partition that received
+                            // rows since the last barrier can hold an un-emitted match (anything from
+                            // an earlier epoch was emitted at that epoch's barrier, so it is already
+                            // in `last_emitted` and the eviction prune below drops it without a
+                            // retraction). For an already-emitted match this diff is a no-op anyway,
+                            // so the gate only skips wasted work. `dirty_partitions` is drained at the
+                            // barrier, so at watermark time it names exactly the partitions with
+                            // un-emitted rows this epoch.
+                            //
+                            // This runs before the eviction's own matcher refresh (over the safe
+                            // prefix, below), which rolls the matcher back to that prefix; the diff
+                            // is deterministic, so re-diffing at the barrier (if the partition stays
+                            // dirty) is a no-op — a pure reordering of the same ops into the
+                            // pre-barrier part of the epoch, never different content.
+                            if emit_on_update && dirty_partitions.contains(&partition_key) {
+                                let inc = matchers
+                                    .entry(partition_key.clone())
+                                    .or_insert_with(|| {
+                                        IncrementalMatcher::new(&nfa, skip.clone())
+                                    });
+                                let ops = emit_partition_diff(
+                                    inc,
+                                    &mut last_emitted,
+                                    &partition_key,
+                                    &rows,
+                                    &defines,
+                                    within.as_ref(),
+                                    &measures,
+                                )
+                                .await?;
+                                for (op, out_row) in ops {
+                                    if let Some(c) = builder.append_row(op, out_row) {
+                                        yield Message::Chunk(c);
+                                    }
+                                }
                             }
 
                             // The prefix with leading `order_key < w` is final. Strictly below `w`:
@@ -1344,12 +1456,28 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
 
                             // Under emit-on-update, keep `last_emitted` consistent with eviction:
                             // every match whose start row was just evicted is finalized — a permanent
-                            // result already delivered as an Insert — so drop it from the diff base
-                            // *without* emitting a retract. Matches whose start survives stay in the
-                            // base and are re-diffed at the next barrier. Keying on the surviving
-                            // seqs covers both the `finalize_before_seq` and matcher-drop paths above
-                            // uniformly (a live/emitted match's start is never evicted, since
-                            // `reaches_boundary_alive` keeps it). Task 7 hardens this interplay.
+                            // result already delivered as an Insert (the emit-before-finalize block
+                            // above guarantees it was emitted this epoch if it had not been already)
+                            // — so drop it from the diff base *without* emitting a retract. Matches
+                            // whose start survives stay in the base and are re-diffed at the next
+                            // barrier. Keying on the surviving seqs covers both the
+                            // `finalize_before_seq` and matcher-drop paths above uniformly (a
+                            // live/emitted match's start is never evicted, since
+                            // `reaches_boundary_alive` keeps it).
+                            //
+                            // WITHIN-expiry semantics (why a retract is never correct here):
+                            //  * A *partial* (incomplete) match dying at its WITHIN deadline was
+                            //    never in the provisional set — only *complete* matches are — so it
+                            //    was never emitted; its rows just evict, invisibly to downstream.
+                            //    Nothing to retract, and it is not in `last_emitted` to prune.
+                            //  * A *complete* provisional match that WITHIN-expiry finalizes (its
+                            //    deadline passed, so it can extend no further — see the boundary-emit
+                            //    guard above) is *final*: it was emitted (above), stays live
+                            //    downstream, and is only dropped from the diffable base here — no
+                            //    retraction. Finality cannot invalidate a match computed over the same
+                            //    buffer (spec §5), so the watermark path never *creates* a retract; a
+                            //    retract arises only through the normal barrier diff, when later input
+                            //    supersedes a still-provisional match.
                             if emit_on_update
                                 && retain_from > 0
                                 && last_emitted.contains_key(&partition_key)
@@ -1515,57 +1643,27 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 continue;
                             }
 
-                            // In emit-on-update the whole buffer is the match window.
-                            let safe_len = rows.len();
-                            let matcher = DefineMatcher {
-                                rows: &rows,
-                                safe_len,
-                                defines: &defines,
-                                within: within.as_ref(),
-                            };
+                            // Diff this partition's whole-buffer provisional set against the diff
+                            // base and stream the ops; the helper advances the base to what we just
+                            // emitted (same code the watermark arm's emit-before-finalize runs).
                             let inc = matchers
                                 .entry(partition_key.clone())
                                 .or_insert_with(|| IncrementalMatcher::new(&nfa, skip.clone()));
-                            refresh_matcher(inc, &rows, safe_len, &matcher).await?;
-
-                            // Rebuild the current provisional set as `(match, output row)`, mapping
-                            // each seq-anchored match back to its buffer position for measure
-                            // evaluation.
-                            let mut seq_to_pos: HashMap<i64, usize> =
-                                HashMap::with_capacity(safe_len);
-                            for (p, r) in rows.iter().enumerate() {
-                                seq_to_pos.insert(r.seq, p);
-                            }
-                            let mut new_emitted: Vec<(SeqMatch, OwnedRow)> =
-                                Vec::with_capacity(inc.provisional().len());
-                            for m in inc.provisional() {
-                                let start = seq_to_pos[&m.start_seq];
-                                let out_row = build_match_row(
-                                    &measures,
-                                    &rows,
-                                    &partition_key,
-                                    start,
-                                    &m.labels,
-                                )
-                                .await?;
-                                new_emitted.push((m.clone(), out_row));
-                            }
-
-                            // Diff the current provisional set against the diff base and stream the
-                            // ops, then advance the base to what we just emitted.
-                            let ops = {
-                                let prev = last_emitted
-                                    .get(&partition_key)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[]);
-                                diff_provisional(prev, &new_emitted)
-                            };
+                            let ops = emit_partition_diff(
+                                inc,
+                                &mut last_emitted,
+                                &partition_key,
+                                &rows,
+                                &defines,
+                                within.as_ref(),
+                                &measures,
+                            )
+                            .await?;
                             for (op, out_row) in ops {
                                 if let Some(c) = builder.append_row(op, out_row) {
                                     yield Message::Chunk(c);
                                 }
                             }
-                            last_emitted.insert(partition_key, new_emitted);
                         }
                         if let Some(c) = builder.take() {
                             yield Message::Chunk(c);
@@ -1611,8 +1709,8 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         // `last_emitted` cannot be rebuilt from state without re-emitting, so clearing
                         // it means the next barrier re-inserts every surviving partition's provisional
                         // matches (downstream sees duplicate Inserts). Persisting/reconstructing the
-                        // diff base across recovery and rescale is deferred to Task 7; for now this
-                        // keeps the base from going stale-wrong on a re-homed partition.
+                        // diff base across recovery and rescale is deferred to a later task; for now
+                        // this keeps the base from going stale-wrong on a re-homed partition.
                         last_emitted.clear();
                         if cache_may_stale {
                             row_id_gen = RowIdGenerator::new(

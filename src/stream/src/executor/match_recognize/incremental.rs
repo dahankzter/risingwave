@@ -1384,4 +1384,87 @@ mod tests {
         // seq 2 sits at position 2, past the frozen prefix (next_pos == 0): must panic.
         inc.finalize_before_seq(2);
     }
+
+    /// (Task 7, Step 1) After `finalize_before_seq` evicts a frozen match, the matcher never
+    /// revisits its rows: subsequent `advance`s extend only the *surviving* matches, and a
+    /// `diff_provisional` against the executor's pruned diff base (the finalized start dropped)
+    /// emits no op touching that start.
+    ///
+    /// The pattern is the greedy `a b+`, whose trailing quantifier *would* keep swallowing later
+    /// `b`s if a match were still open — the concrete "later rows would have extended it under
+    /// PastLastRow" shape from the brief. It cannot re-extend the finalized `a b` here, and that is
+    /// the freezing invariant, not luck: a match only freezes once its whole scan region is dead at
+    /// the boundary, and a position dead at a boundary stays dead at every larger boundary, so no
+    /// appended row can revive it. Finalization then drains the frozen match's rows from
+    /// `seq_index` and rebases the scan cursor past them, so the later `b` attaches to the surviving
+    /// second match instead. This locks in the property Task 7's watermark emit-before-finalize
+    /// relies on: a finalized match is a permanent result the diff base must forget without a
+    /// retraction, and later input can neither resurrect nor mutate it.
+    #[tokio::test]
+    async fn finalize_evicts_then_later_rows_never_revisit_finalized_match() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        // 0:a 1:b 2:a 3:b -> the first `a b` = (0,2) freezes (its region goes dead at the boundary
+        // once the second match's `a` at position 2 breaks the greedy `b+`); the trailing (2,4)
+        // stays open at the boundary and does not freeze.
+        let pre = from_str("abab");
+        let m_pre = SetMatcher::new(pre.clone());
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3], &m_pre).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (2, 4, labels(&["a", "b"]))]
+        );
+        assert_eq!(inc.frozen(), 1); // only the first match froze; the trailing one is still open
+
+        // Executor-side diff base: everything currently provisional has been emitted (one row per
+        // match, keyed by its start seq so an op referencing the finalized start is detectable).
+        let base: Vec<(SeqMatch, OwnedRow)> = inc
+            .provisional()
+            .iter()
+            .map(|m| (m.clone(), orow(m.start_seq)))
+            .collect();
+
+        // Finalize before seq 2: evict [0:a, 1:b], returning the frozen (0,2). The executor prunes
+        // the finalized start from its base without a retraction (a finalized match is permanent).
+        let removed = inc.finalize_before_seq(2);
+        assert_eq!(seq_triples(&removed), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(provisional_triples(&inc), vec![(2, 4, labels(&["a", "b"]))]);
+        let mut base_pruned = base.clone();
+        base_pruned.retain(|(m, _)| !removed.iter().any(|fm| fm.start_seq == m.start_seq));
+
+        // Feed a later `b` (seq 4). If the matcher revisited the evicted `a b`, the greedy `b+`
+        // would extend it to `a b b`; instead its rows are gone and the surviving second match
+        // (seq 2) grows to `a b b` = (2,5). The matcher indexes the rebased surviving buffer: old
+        // positions 2,3 sit at 0,1 (rows {a},{b}) and seq 4 lands at position 2.
+        let tail = from_str("abb");
+        let m_tail = SetMatcher::new(tail.clone());
+        inc.advance(&[4], &m_tail).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(2, 5, labels(&["a", "b", "b"]))]
+        );
+        assert!(
+            inc.provisional().iter().all(|m| m.start_seq != 0),
+            "finalized match start must never be revisited"
+        );
+
+        // The diff against the pruned base emits no op referencing the finalized start (its base row
+        // is orow(0)); the only ops revise the surviving match (seq 2), whose extent changed.
+        let new_emitted: Vec<(SeqMatch, OwnedRow)> = inc
+            .provisional()
+            .iter()
+            .map(|m| (m.clone(), orow(m.start_seq)))
+            .collect();
+        let ops = diff_provisional(&base_pruned, &new_emitted);
+        assert!(
+            ops.iter().all(|(_, row)| row != &orow(0)),
+            "no diff op may touch the finalized match"
+        );
+    }
 }
