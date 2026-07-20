@@ -579,34 +579,29 @@ async fn build_match_row(
         .into_owned_row())
 }
 
-/// Compute one partition's emit-on-update changelog: refresh its matcher over the *whole* buffer
-/// (in emit-on-update the match window is all data-so-far — "as if input ended now" — not the
-/// watermark-safe prefix), rebuild every provisional match's output row, diff against the
-/// last-emitted base, and advance the base to the new set. Returns the `Delete`/`Insert` ops for
-/// the caller to stream — a plain async fn cannot `yield` — while updating `last_emitted` and the
-/// cached matcher in place. `rows` is the partition's buffer, already read by the caller, and must
-/// be non-empty (the caller handles the drained-partition case, where there is nothing to diff).
+/// Compute one partition's current emit-on-update provisional set as `(match, output row)` pairs,
+/// WITHOUT diffing or touching `last_emitted`. Refreshes the matcher over the *whole* buffer (in
+/// emit-on-update the match window is all data-so-far — "as if input ended now" — not the
+/// watermark-safe prefix), then rebuilds each provisional match's output row. `rows` is the
+/// partition's buffer, already read by the caller, and must be non-empty. `inc` is the partition's
+/// cached matcher (`matchers.entry(..)`); the helper refreshes it over the whole buffer and leaves
+/// it there.
 ///
-/// Shared by two callers so they produce byte-identical output and stay in lockstep:
-/// * the barrier arm — the normal emit-on-update path, diffing every dirty partition before commit;
-/// * the watermark arm's emit-before-finalize — which runs this first, before eviction removes any
-///   rows, to close the never-emitted-match hole (see that call site).
+/// This is the "compute" half shared by two uses so they produce byte-identical sets:
+/// * [`emit_partition_diff`] — diffs this set against the base and advances it (the emit path);
+/// * [`rebuild_last_emitted`] — seeds the base with this set on recovery/rescale, emitting nothing.
 ///
-/// The diff is deterministic in the buffer content, so running it twice with no intervening change
-/// (watermark then barrier) is a no-op the second time: the extra call only reorders the same ops
-/// earlier within the epoch, never changing what is emitted.
-///
-/// `inc` is the partition's cached matcher, resolved by the caller (`matchers.entry(..)`); the
-/// helper refreshes it over the whole buffer and leaves it there.
-async fn emit_partition_diff(
+/// Deterministic in the buffer content: the same buffer yields the same matcher feed, the same
+/// `provisional()`, and the same `build_match_row` output rows. That determinism is what lets the
+/// recovery/rescale rebuild seed the base without re-emitting.
+async fn compute_partition_emitted(
     inc: &mut IncrementalMatcher,
-    last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
     partition_key: &OwnedRow,
     rows: &[BufferedRow],
     defines: &HashMap<String, CompiledDefine>,
     within: Option<&NonStrictExpression>,
     measures: &[CompiledMeasure],
-) -> StreamExecutorResult<Vec<(Op, OwnedRow)>> {
+) -> StreamExecutorResult<Vec<(SeqMatch, OwnedRow)>> {
     // In emit-on-update the whole buffer is the match window.
     let safe_len = rows.len();
     let matcher = DefineMatcher {
@@ -629,6 +624,35 @@ async fn emit_partition_diff(
         let out_row = build_match_row(measures, rows, partition_key, start, &m.labels).await?;
         new_emitted.push((m.clone(), out_row));
     }
+    Ok(new_emitted)
+}
+
+/// Compute one partition's emit-on-update changelog: recompute its provisional set over the whole
+/// buffer (via [`compute_partition_emitted`]), diff against the last-emitted base, and advance the
+/// base to the new set. Returns the `Delete`/`Insert` ops for the caller to stream — a plain async
+/// fn cannot `yield` — while updating `last_emitted` and the cached matcher in place. `rows` is the
+/// partition's buffer, already read by the caller, and must be non-empty (the caller handles the
+/// drained-partition case, where there is nothing to diff).
+///
+/// Shared by two callers so they produce byte-identical output and stay in lockstep:
+/// * the barrier arm — the normal emit-on-update path, diffing every dirty partition before commit;
+/// * the watermark arm's emit-before-finalize — which runs this first, before eviction removes any
+///   rows, to close the never-emitted-match hole (see that call site).
+///
+/// The diff is deterministic in the buffer content, so running it twice with no intervening change
+/// (watermark then barrier) is a no-op the second time: the extra call only reorders the same ops
+/// earlier within the epoch, never changing what is emitted.
+async fn emit_partition_diff(
+    inc: &mut IncrementalMatcher,
+    last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
+    partition_key: &OwnedRow,
+    rows: &[BufferedRow],
+    defines: &HashMap<String, CompiledDefine>,
+    within: Option<&NonStrictExpression>,
+    measures: &[CompiledMeasure],
+) -> StreamExecutorResult<Vec<(Op, OwnedRow)>> {
+    let new_emitted =
+        compute_partition_emitted(inc, partition_key, rows, defines, within, measures).await?;
 
     // Diff the current provisional set against the diff base, then advance the base to it.
     let ops = {
@@ -640,6 +664,110 @@ async fn emit_partition_diff(
     };
     last_emitted.insert(partition_key.clone(), new_emitted);
     Ok(ops)
+}
+
+/// Rebuild the emit-on-update diff base (`last_emitted`) after recovery or a vnode-bitmap change,
+/// WITHOUT emitting anything. For every partition with a buffer in the currently-owned vnodes,
+/// recompute its provisional set over the whole buffer and seed `last_emitted` with it (populating
+/// `matchers` as a side effect). By determinism the recomputed set is byte-identical to what the
+/// pre-crash / pre-rescale actor last emitted for the same committed buffer, so it already equals
+/// the rows downstream holds at the recovered epoch — re-emitting them would double-Insert. Hence
+/// this diffs nothing and yields nothing; the next barrier diffs genuine new input against this base
+/// and emits only the delta. Partitions rebuilt here are deliberately left OUT of `dirty_partitions`
+/// (nothing changed), so a later chunk marks them dirty as usual and the next barrier diffs against
+/// this rebuilt base.
+///
+/// Emit-on-update only: EMIT ON WINDOW CLOSE has no `last_emitted` and must not pay this cost.
+///
+/// Cost: one full matcher pass over each owned partition's buffer at startup — the recovery-latency
+/// trade the design (spec §6) chose over persisting a second changelog state table (the base is a
+/// pure derivation of the buffer, so recomputing it is cheaper overall than maintaining it on disk).
+///
+/// Partition enumeration scans the BUFFER table itself per owned vnode: its PK is `(partition
+/// columns, ORDER BY columns, seq)` and `iter_with_vnode` yields memcomparable PK order, so a
+/// partition's rows are contiguous within its vnode — one pass groups consecutive rows by partition
+/// key, holding a single partition's rows resident at a time (the same memory bound as the
+/// watermark/barrier scans), and is complete by construction: a partition has rows iff the scan
+/// sees them.
+///
+/// The wakeup-frontier index is NOT a valid enumerator here, even though the watermark arm drives
+/// its visits from it: the frontier drops a partition's entry whenever it has no future wakeup
+/// (`remove_frontier` on `new_wakeup == None` in the watermark arm), which is reachable with rows
+/// still buffered — all rows watermark-safe (`safe_len == rows.len()`) yet retained as live match
+/// starts (a boundary-complete match is held alive by the boundary-before-accept check), with no
+/// `WITHIN` deadline to schedule. The default no-`WITHIN` query shape hits this for every idle
+/// partition holding a boundary-complete match; enumerating from the frontier would skip exactly
+/// those partitions, leave their diff base empty, and duplicate-Insert their already-emitted
+/// matches at the next barrier.
+#[expect(clippy::too_many_arguments)]
+async fn rebuild_last_emitted<S: StateStore>(
+    state_table: &StateTable<S>,
+    matchers: &mut HashMap<OwnedRow, IncrementalMatcher>,
+    last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
+    nfa: &Nfa,
+    skip: &SkipMode,
+    defines: &HashMap<String, CompiledDefine>,
+    within: Option<&NonStrictExpression>,
+    measures: &[CompiledMeasure],
+    input_arity: usize,
+    time_col: usize,
+    partition_key_indices: &[usize],
+) -> StreamExecutorResult<()> {
+    let vnodes: Vec<_> = state_table.vnodes().iter_vnodes().collect();
+    for vnode in vnodes {
+        let sub_range: (Bound<OwnedRow>, Bound<OwnedRow>) = (Bound::Unbounded, Bound::Unbounded);
+        let iter = state_table
+            .iter_with_vnode(vnode, &sub_range, PrefetchOptions::default())
+            .await?;
+        pin_mut!(iter);
+        // Current group: one partition's key and its buffered rows (in PK order, i.e. ORDER BY
+        // order), seeded into `last_emitted` when the key changes or the vnode's scan ends.
+        let mut cur: Option<(OwnedRow, Vec<BufferedRow>)> = None;
+        while let Some(item) = iter.next().await {
+            // Stored row layout: `[ seq, <input cols..> ]` (same parse as the watermark/barrier
+            // scans); the partition key is projected from the input columns, exactly as at ingest.
+            let row = item?.into_owned_row();
+            let seq = row.datum_at(0).expect("seq not null").into_int64();
+            let input_row = OwnedRow::new(
+                (1..1 + input_arity)
+                    .map(|i| row.datum_at(i).to_owned_datum())
+                    .collect(),
+            );
+            let partition_key = (&input_row).project(partition_key_indices).into_owned_row();
+            let order_key = input_row.datum_at(time_col).to_owned_datum();
+            let brow = BufferedRow {
+                seq,
+                order_key,
+                row: input_row,
+            };
+            match &mut cur {
+                Some((k, rows)) if *k == partition_key => rows.push(brow),
+                _ => {
+                    // Partition boundary: seed the finished group, then start the new one.
+                    if let Some((k, rows)) = cur.take() {
+                        let inc = matchers
+                            .entry(k.clone())
+                            .or_insert_with(|| IncrementalMatcher::new(nfa, skip.clone()));
+                        let new_emitted =
+                            compute_partition_emitted(inc, &k, &rows, defines, within, measures)
+                                .await?;
+                        last_emitted.insert(k, new_emitted);
+                    }
+                    cur = Some((partition_key, vec![brow]));
+                }
+            }
+        }
+        // Seed the vnode's last group.
+        if let Some((k, rows)) = cur.take() {
+            let inc = matchers
+                .entry(k.clone())
+                .or_insert_with(|| IncrementalMatcher::new(nfa, skip.clone()));
+            let new_emitted =
+                compute_partition_emitted(inc, &k, &rows, defines, within, measures).await?;
+            last_emitted.insert(k, new_emitted);
+        }
+    }
+    Ok(())
 }
 
 pub struct MatchRecognizeExecutorArgs<S: StateStore> {
@@ -938,8 +1066,10 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
         // accumulates the partition keys that received rows since the last barrier — the barrier arm
         // re-diffs exactly those. `last_emitted` is the diff base: per partition, the `(match,
         // output row)` set we last told downstream is live, so a Delete can re-emit the exact prior
-        // row. Both are in-memory derivations cleared on a vnode-bitmap change (like `matchers`); a
-        // later task persists/rebuilds `last_emitted` so recovery/rescale does not re-emit.
+        // row. Both are in-memory derivations. `last_emitted` is rebuilt silently from the buffer on
+        // recovery (just below) and on a vnode-bitmap change (see `rebuild_last_emitted`) so neither
+        // re-emits rows downstream already holds; `matchers` (and `dirty_partitions`) are cleared on
+        // a vnode-bitmap change and rebuilt lazily.
         let mut dirty_partitions: HashSet<OwnedRow> = HashSet::new();
         let mut last_emitted: HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>> = HashMap::new();
 
@@ -947,8 +1077,36 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
         // written through immediately; each watermark scans the buffered rows back in PK order
         // (partition, order key, seq), processing one partition at a time and holding only that
         // partition's rows resident — so memory is bounded by the largest single partition's live
-        // buffer, not by a whole vnode or the number of distinct keys. Recovery and rescale need no
-        // in-memory rebuild.
+        // buffer, not by a whole vnode or the number of distinct keys. The buffer itself needs no
+        // in-memory rebuild on recovery/rescale (the state table is authoritative); the one derived
+        // structure that cannot be reconstructed without re-emitting is the emit-on-update diff base,
+        // rebuilt silently next.
+
+        // Recovery: the state tables were just restored to the recovered epoch, but `last_emitted`
+        // (the emit-on-update diff base) is in-memory and starts empty. If the first barrier diffed
+        // each partition's provisional set against an empty base it would re-Insert every match —
+        // duplicates, since those rows are already in the MV from before the crash. Instead rebuild
+        // the base silently now, BEFORE processing any input: recompute each owned partition's
+        // provisional set and seed `last_emitted`, emitting nothing. By determinism the recomputation
+        // equals what downstream already holds at the recovered epoch, so the next barrier emits only
+        // genuine new deltas (and a partition rebuilt here is not marked dirty). On a cold start the
+        // tables are empty, so this is a no-op. EMIT ON WINDOW CLOSE has no diff base — skip it.
+        if emit_on_update {
+            rebuild_last_emitted(
+                &state_table,
+                &mut matchers,
+                &mut last_emitted,
+                &nfa,
+                &skip,
+                &defines,
+                within.as_ref(),
+                &measures,
+                input_arity,
+                time_col,
+                &partition_key_indices,
+            )
+            .await?;
+        }
 
         #[for_await]
         for msg in input {
@@ -1705,13 +1863,36 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         // derivation of a buffer this actor no longer owns (the rescale-desync
                         // precedent). Each surviving partition rebuilds lazily from its scanned buffer.
                         matchers.clear();
-                        // Drop the emit-on-update diff base for the same reason. Unlike `matchers`,
-                        // `last_emitted` cannot be rebuilt from state without re-emitting, so clearing
-                        // it means the next barrier re-inserts every surviving partition's provisional
-                        // matches (downstream sees duplicate Inserts). Persisting/reconstructing the
-                        // diff base across recovery and rescale is deferred to a later task; for now
-                        // this keeps the base from going stale-wrong on a re-homed partition.
+                        // Drop the emit-on-update diff base for the same reason, then rebuild it
+                        // silently from the now-owned buffers. Clearing alone would make the next
+                        // barrier re-Insert every re-homed partition's provisional matches, but
+                        // downstream still holds those rows from the pre-rescale actor's emissions;
+                        // by determinism the recomputation over the same committed buffer matches
+                        // them, so seeding the base without emitting keeps downstream correct. The
+                        // owned set is authoritative here: `post_yield_barrier` has applied the new
+                        // bitmap to all three tables, so the rebuild scans exactly the partitions
+                        // this actor now owns. This is emit-on-update only.
                         last_emitted.clear();
+                        // Partitions rebuilt below must not be left dirty (nothing changed). The
+                        // barrier emit above already drained `dirty_partitions`; clear defensively so
+                        // a rebuilt partition is only re-diffed once a later chunk marks it dirty.
+                        dirty_partitions.clear();
+                        if emit_on_update {
+                            rebuild_last_emitted(
+                                &state_table,
+                                &mut matchers,
+                                &mut last_emitted,
+                                &nfa,
+                                &skip,
+                                &defines,
+                                within.as_ref(),
+                                &measures,
+                                input_arity,
+                                time_col,
+                                &partition_key_indices,
+                            )
+                            .await?;
+                        }
                         if cache_may_stale {
                             row_id_gen = RowIdGenerator::new(
                                 state_table.vnodes().iter_vnodes(),

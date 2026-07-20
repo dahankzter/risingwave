@@ -500,6 +500,69 @@ mod tests {
         assert_eq!(diff_provisional(&old, &new), vec![]);
     }
 
+    /// Recovery-rebuild seam (Task 8). On recovery the executor reseeds its emit-on-update diff
+    /// base by feeding the recovered buffer to a FRESH matcher (`rebuild_last_emitted` →
+    /// `compute_partition_emitted`) and emitting nothing. That silent reseed is sound only if the
+    /// from-scratch recomputation reproduces the pre-crash matcher's provisional set exactly — the
+    /// set downstream already holds. This test exercises that property at the matcher+diff seam:
+    /// the pre-crash side reaches its state through multi-visit incremental advances, a
+    /// finalize-eviction (the finalized match left the base without a retract, its rows left the
+    /// buffer), and a further advance; the recovery side is one whole-buffer feed of the surviving
+    /// rows into a fresh matcher — exactly what the rebuild does. Both must agree on full
+    /// `(start, end, labels)` triples, and a diff between output rows synthesized deterministically
+    /// from each match (`build_match_row` is deterministic in the same way: pure in buffer content)
+    /// must be empty — the reseed leaves nothing to re-emit at the next barrier.
+    #[tokio::test]
+    async fn recovery_rebuild_reproduces_pre_crash_provisional_set() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+        // Deterministic stand-in for `build_match_row`: a pure function of the match content.
+        let out_row = |m: &SeqMatch| orow(m.start_seq * 1000 + m.end_seq);
+
+        // Pre-crash: rows 0:a 1:b 2:a 3:b arrive across two visits; the first `a b` = (0,2)
+        // freezes once the `a` at position 2 breaks the greedy `b+`.
+        let pre = from_str("abab");
+        let m_pre = SetMatcher::new(pre.clone());
+        let mut pre_inc = IncrementalMatcher::new(&nfa, skip.clone());
+        pre_inc.advance(&[0, 1], &m_pre).await.unwrap();
+        pre_inc.advance(&[2, 3], &m_pre).await.unwrap();
+        // A watermark finalizes and evicts the frozen (0,2): its rows leave the buffer and it
+        // leaves the diff base without a retraction (a permanent result downstream).
+        let removed = pre_inc.finalize_before_seq(2);
+        assert_eq!(seq_triples(&removed), vec![(0, 2, labels(&["a", "b"]))]);
+        // One more row arrives; the last pre-crash barrier emitted this provisional set, so the
+        // MV's provisional portion == this base. Surviving buffer: seqs 2,3,4 = {a},{b},{b}.
+        let tail = from_str("abb");
+        let m_tail = SetMatcher::new(tail.clone());
+        pre_inc.advance(&[4], &m_tail).await.unwrap();
+        let pre_base: Vec<(SeqMatch, OwnedRow)> = pre_inc
+            .provisional()
+            .iter()
+            .map(|m| (m.clone(), out_row(m)))
+            .collect();
+        assert!(!pre_base.is_empty());
+
+        // Crash. Recovery: the restored state table holds only the surviving rows; the rebuild
+        // feeds them, whole-buffer, into a FRESH matcher.
+        let mut rec_inc = IncrementalMatcher::new(&nfa, skip.clone());
+        rec_inc.advance(&[2, 3, 4], &m_tail).await.unwrap();
+        let rec_set: Vec<(SeqMatch, OwnedRow)> = rec_inc
+            .provisional()
+            .iter()
+            .map(|m| (m.clone(), out_row(m)))
+            .collect();
+
+        // The from-scratch recomputation reproduces the pre-crash provisional set exactly...
+        assert_eq!(provisional_triples(&rec_inc), provisional_triples(&pre_inc));
+        // ...so seeding `last_emitted` with it and re-diffing (as the next barrier would over an
+        // unchanged buffer) re-emits nothing — the silent rebuild is exact, not approximate.
+        assert_eq!(diff_provisional(&pre_base, &rec_set), vec![]);
+    }
+
     /// Same extent and labels, but the evaluated output row changed — still a revision (the diff
     /// compares the output row, not just the span/labels).
     #[test]
