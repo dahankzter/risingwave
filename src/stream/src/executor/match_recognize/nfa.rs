@@ -1003,6 +1003,34 @@ fn permutations(items: &[String]) -> Vec<Vec<String>> {
     out
 }
 
+/// A [`CandidateMatcher`] backed by precomputed satisfied-sets: `rows[pos]` is the set of variables
+/// the row at `pos` satisfies. The dynamic driver checked against this should agree with the static
+/// [`Nfa::find_matches_labeled`]. Test-only, but `pub(crate)` so the sibling `incremental` module's
+/// differential-oracle tests can reuse the exact same reference matcher as `nfa`'s own tests.
+#[cfg(test)]
+pub(crate) struct SetMatcher {
+    rows: Vec<BTreeSet<String>>,
+}
+
+#[cfg(test)]
+impl SetMatcher {
+    pub(crate) fn new(rows: Vec<BTreeSet<String>>) -> Self {
+        Self { rows }
+    }
+}
+
+#[cfg(test)]
+impl CandidateMatcher for SetMatcher {
+    async fn matches(
+        &self,
+        var: &str,
+        pos: usize,
+        _labels: &[String],
+    ) -> StreamExecutorResult<bool> {
+        Ok(self.rows[pos].contains(var))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,22 +1412,6 @@ mod tests {
             BTreeSet::from(["b".to_owned()]),
         ];
         assert_eq!(nfa.longest_match(&rows, 0), Some(2));
-    }
-
-    /// A [`CandidateMatcher`] backed by precomputed satisfied-sets — the dynamic driver should then
-    /// agree with the static [`Nfa::find_matches_labeled`].
-    struct SetMatcher {
-        rows: Vec<BTreeSet<String>>,
-    }
-    impl CandidateMatcher for SetMatcher {
-        async fn matches(
-            &self,
-            var: &str,
-            pos: usize,
-            _labels: &[String],
-        ) -> StreamExecutorResult<bool> {
-            Ok(self.rows[pos].contains(var))
-        }
     }
 
     #[tokio::test]

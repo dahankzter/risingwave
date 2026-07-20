@@ -17,11 +17,13 @@
 //! Contains the pure row-pattern NFA ([`nfa`]) and the streaming executor built on top of it.
 
 mod executor;
+mod incremental;
 mod nfa;
 mod proto;
 
 pub use executor::{
     CompiledDefine, CompiledMeasure, MatchRecognizeExecutor, MatchRecognizeExecutorArgs,
 };
+pub use incremental::{IncrementalMatcher, SeqMatch};
 pub use nfa::{Nfa, SkipMode};
 pub use proto::pattern_from_protobuf;
