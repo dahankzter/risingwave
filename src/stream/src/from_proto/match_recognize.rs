@@ -153,6 +153,7 @@ impl ExecutorBuilder for MatchRecognizeExecutorBuilder {
             state_table,
             frontier_meta_table,
             frontier_index_table,
+            emit_on_update: node.emit_on_update,
         });
 
         Ok((params.info, exec).into())

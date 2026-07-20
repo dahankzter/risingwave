@@ -37,29 +37,43 @@ use crate::stream_fragmenter::BuildFragmentGraphState;
 pub struct StreamMatchRecognize {
     pub base: PlanBase<Stream>,
     core: generic::MatchRecognize<PlanRef<Stream>>,
+    /// Whether this node plans in Emit-On-Update mode (the plain form, without `EMIT ON WINDOW
+    /// CLOSE`). Stored for `try_to_stream_prost_body`; the executor does not yet act on it.
+    emit_on_update: bool,
 }
 
 impl StreamMatchRecognize {
-    pub fn new(core: generic::MatchRecognize<PlanRef<Stream>>) -> Self {
-        // ONE ROW PER MATCH emits one row per completed match over append-only input, so the output
-        // is append-only. The output schema is the partition-by columns followed by the measures, so
-        // the partition key occupies the leading `n_part` output columns; the input was sharded by
-        // the partition key (see `to_stream`), so the output is hash-sharded on those columns.
+    pub fn new(core: generic::MatchRecognize<PlanRef<Stream>>, emit_on_update: bool) -> Self {
+        // ONE ROW PER MATCH emits one row per completed match over append-only input. The output
+        // schema is the partition-by columns followed by the measures, so the partition key occupies
+        // the leading `n_part` output columns; the input was sharded by the partition key (see
+        // `to_stream`), so the output is hash-sharded on those columns.
         let n_part = core.partition_by.len();
         let dist = Distribution::HashShard((0..n_part).collect());
+        let (stream_kind, eowc) = if emit_on_update {
+            // Emit-On-Update mode: provisional matches are corrected by retractions, so the output
+            // is a retract stream. The executor does not emit retractions yet (a later change wires
+            // the behavior), but the plan already declares the mode it is heading towards.
+            (StreamKind::Retract, false)
+        } else {
+            // Emit-On-Window-Close mode: the operator emits only FINAL matches, at the watermark —
+            // i.e. it already satisfies Emit-On-Window-Close semantics. Declaring it lets
+            // `EMIT ON WINDOW CLOSE` queries name today's behavior explicitly.
+            (StreamKind::AppendOnly, true)
+        };
         let base = PlanBase::new_stream_with_core(
             &core,
             dist,
-            StreamKind::AppendOnly,
-            // The operator emits only FINAL matches, at the watermark — i.e. it already satisfies
-            // Emit-On-Window-Close semantics. Declaring it lets `EMIT ON WINDOW CLOSE` queries name
-            // today's behavior explicitly, so a future emit-on-update mode can take over the plain
-            // form without silently changing the meaning of queries that were explicit.
-            true,
+            stream_kind,
+            eowc,
             WatermarkColumns::new(),
             MonotonicityMap::new(),
         );
-        Self { base, core }
+        Self {
+            base,
+            core,
+            emit_on_update,
+        }
     }
 
     /// Per-partition buffered-row state table. Layout:
@@ -203,7 +217,7 @@ impl PlanTreeNodeUnary<Stream> for StreamMatchRecognize {
     fn clone_with_input(&self, input: PlanRef<Stream>) -> Self {
         let mut core = self.core.clone();
         core.input = input;
-        Self::new(core)
+        Self::new(core, self.emit_on_update)
     }
 }
 
@@ -349,6 +363,7 @@ impl TryToStreamPb for StreamMatchRecognize {
                 .as_ref()
                 .map(|w| w.to_expr_proto_checked_pure(retract, "match_recognize within deadline"))
                 .transpose()?,
+            emit_on_update: self.emit_on_update,
         })))
     }
 }
@@ -364,6 +379,7 @@ impl ExprRewritable<Stream> for StreamMatchRecognize {
         Self {
             base: self.base.clone_with_new_plan_id(),
             core,
+            emit_on_update: self.emit_on_update,
         }
         .into()
     }

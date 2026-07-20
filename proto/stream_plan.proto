@@ -1173,6 +1173,11 @@ message MatchRecognizeNode {
   // (`InputRef(0) + interval`). The watermark at which a partial starting at that row expires;
   // used to wake an idle partition to evict it. Absent when there is no WITHIN clause.
   optional expr.ExprNode within_deadline = 15;
+  // Emit-On-Update mode: the plain (default-emit) form, without `EMIT ON WINDOW CLOSE`. The
+  // executor emits provisional matches as rows become safe and corrects them with retractions as
+  // later rows or the watermark revise the match, instead of waiting for the watermark to emit only
+  // finalized matches. Stored for the executor; emission behavior is wired in a later change.
+  bool emit_on_update = 16;
 
   reserved 7;
   reserved "pattern";

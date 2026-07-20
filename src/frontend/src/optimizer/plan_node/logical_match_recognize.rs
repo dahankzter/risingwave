@@ -200,19 +200,12 @@ impl ToStream for LogicalMatchRecognize {
     fn to_stream(&self, ctx: &mut ToStreamContext) -> Result<super::StreamPlanRef> {
         use super::StreamMatchRecognize;
 
-        // The operator emits only final matches, at the watermark — Emit-On-Window-Close
-        // semantics. Require the query to say so explicitly. This deliberately reserves the plain
-        // (default-emit) form: if an emit-on-update mode (provisional matches corrected by
-        // retractions) is added later, it can take over the plain form under RisingWave's default
-        // emit semantics without silently changing the meaning of any existing query.
-        if !ctx.emit_on_window_close() {
-            return Err(crate::error::ErrorCode::NotSupported(
-                "MATCH_RECOGNIZE emits only final matches (Emit-On-Window-Close semantics)"
-                    .to_owned(),
-                "declare the materialized view with EMIT ON WINDOW CLOSE".to_owned(),
-            )
-            .into());
-        }
+        // `EMIT ON WINDOW CLOSE` selects Emit-On-Window-Close mode: the operator buffers rows and
+        // emits only final matches, at the watermark. Its absence selects Emit-On-Update mode: the
+        // operator emits provisional matches as rows become safe and corrects them with retractions
+        // as later rows or the watermark revise the match. (The executor does not emit retractions
+        // yet — a later change wires the behavior — but the plan already plans for the mode.)
+        let emit_on_update = !ctx.emit_on_window_close();
 
         // v1 restrictions: PARTITION BY / ORDER BY must be plain columns, PARTITION BY non-empty.
         if self.core.partition_key_indices().is_none() || self.core.order_key_indices().is_none() {
@@ -235,10 +228,11 @@ impl ToStream for LogicalMatchRecognize {
         let partition_key_indices = self.core.partition_key_indices().expect("checked above");
 
         let stream_input = self.input().to_stream(ctx)?;
-        // The executor matches over an append-only sequence and emits insert-only results; it has no
-        // semantics for retracting or revising an already-emitted match, and the stream plan node
-        // declares append-only output. Reject a non-append-only input during planning so the user
-        // gets an error at `CREATE`, rather than the executor crashing on the first update/delete.
+        // The executor matches over an append-only sequence: it has no semantics for revising an
+        // already-buffered row if it were retracted or updated after arrival. This holds regardless
+        // of emit mode (both read the same append-only buffer), so reject a non-append-only input
+        // during planning so the user gets an error at `CREATE`, rather than the executor crashing on
+        // the first update/delete.
         if !stream_input.append_only() {
             bail!(
                 "MATCH_RECOGNIZE requires an append-only input; updates and deletes are not supported"
@@ -246,7 +240,9 @@ impl ToStream for LogicalMatchRecognize {
         }
         // Event-time contract: the executor buffers rows and finalises matches as the watermark on
         // the leading ORDER BY column advances, so that column must carry a watermark. This mirrors
-        // Flink requiring a rowtime attribute on ORDER BY.
+        // Flink requiring a rowtime attribute on ORDER BY. Required for both emit modes: even in
+        // Emit-On-Update mode, finalization (and thus eventual retraction-free correctness) still
+        // depends on the watermark advancing.
         if !stream_input.watermark_columns().contains(time_col) {
             bail!(
                 "MATCH_RECOGNIZE requires a watermark on the leading ORDER BY column for streaming"
@@ -269,7 +265,7 @@ impl ToStream for LogicalMatchRecognize {
             within: self.core.within.clone(),
             within_deadline: self.core.within_deadline.clone(),
         };
-        Ok(StreamMatchRecognize::new(core).into())
+        Ok(StreamMatchRecognize::new(core, emit_on_update).into())
     }
 
     fn logical_rewrite_for_stream(

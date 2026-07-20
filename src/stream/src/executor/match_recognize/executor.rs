@@ -568,6 +568,10 @@ pub struct MatchRecognizeExecutorArgs<S: StateStore> {
     pub frontier_meta_table: StateTable<S>,
     /// Wakeup frontier: `pk (next_wakeup_order_key, partition...)`, distributed by partition.
     pub frontier_index_table: StateTable<S>,
+    /// Emit-On-Update mode (the plain form, without `EMIT ON WINDOW CLOSE`): the planner has
+    /// already committed to this node emitting a retract stream. Stored for a later change to wire
+    /// the actual emission behavior; not yet read anywhere.
+    pub emit_on_update: bool,
 }
 
 pub struct MatchRecognizeExecutor<S: StateStore> {
@@ -597,6 +601,10 @@ pub struct MatchRecognizeExecutor<S: StateStore> {
     /// visit only the partitions that need attention.
     frontier_meta_table: StateTable<S>,
     frontier_index_table: StateTable<S>,
+    /// Emit-On-Update mode (see [`MatchRecognizeExecutorArgs`]). Stored, not yet acted on: a later
+    /// change wires the emission behavior for this mode.
+    #[allow(dead_code)]
+    emit_on_update: bool,
 }
 
 /// A buffered input row, materialized from the state table while processing one partition.
@@ -637,6 +645,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
             state_table: args.state_table,
             frontier_meta_table: args.frontier_meta_table,
             frontier_index_table: args.frontier_index_table,
+            emit_on_update: args.emit_on_update,
         }
     }
 
@@ -784,6 +793,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
             mut state_table,
             mut frontier_meta_table,
             mut frontier_index_table,
+            emit_on_update: _,
         } = *self;
 
         let mut input = input.execute();
