@@ -254,6 +254,79 @@ impl IncrementalMatcher {
         Ok(())
     }
 
+    /// Finalize (semantically remove) every match lying wholly within the evicted prefix and return
+    /// them in scan order. The caller is evicting those rows from its buffer, so the matches leave
+    /// the diffable set and their fed-row bookkeeping is dropped here; after this call
+    /// [`IncrementalMatcher::provisional`] returns only still-revisable matches.
+    ///
+    /// `seq` is the first row seq that is *not* evicted (an exclusive upper bound), mirroring
+    /// [`IncrementalMatcher::truncate_from_seq`]'s position convention: everything at sorted
+    /// positions before that row's position is gone. A match is finalized when its last row lies
+    /// before that position; a match starting at or after it is kept. A seq that was never fed is a
+    /// no-op (the caller passes the first *surviving* buffered row's seq, which is still fed).
+    ///
+    /// Two contract invariants are `debug_assert`ed — the executor guarantees both by construction
+    /// (finalization happens only at watermark boundaries where the frozen prefix is provably final),
+    /// so they document the contract rather than guard runtime input:
+    /// - the boundary lies within the frozen prefix (`final_pos <= next_pos`): finalization must
+    ///   never reach into the open, still-revisable trailing region;
+    /// - no match straddles the boundary: each match either ends at/before it (finalized) or starts
+    ///   at/after it (kept).
+    ///
+    /// Positions are then **rebased**: the evicted rows physically leave the front of the logical
+    /// buffer, so `seq_index` drains its prefix and `next_pos`/`frozen_count` shift down. Only rows
+    /// at positions `>= final_pos` survive, and rebasing is a uniform downward shift of those rows;
+    /// paths *forward* from a surviving position consume only surviving (unchanged) rows, so the
+    /// freezing-soundness argument (a frozen region is dead at its boundary) is preserved unchanged.
+    /// Match spans are anchored by seq, so both the retained and the returned [`SeqMatch`]es keep
+    /// their identities without adjustment.
+    pub fn finalize_before_seq(&mut self, seq: i64) -> Vec<SeqMatch> {
+        // Seqs are stable identities, not sort keys; find the exact entry. A missing seq means the
+        // boundary row is not (or no longer) buffered here — nothing to finalize.
+        let Some(final_pos) = self.seq_index.iter().position(|&s| s == seq) else {
+            return Vec::new();
+        };
+        debug_assert!(
+            final_pos <= self.next_pos,
+            "finalization boundary at position {final_pos} reaches past the frozen prefix \
+             (next_pos {})",
+            self.next_pos
+        );
+
+        // Finalized matches are a leading run of the frozen prefix: only frozen matches can end
+        // within `[0, next_pos)` (a provisional match starts at `>= next_pos`), and matches are
+        // stored in scan order. Walk them, recovering each start position from `seq_index` (seqs are
+        // identities, not positions), and stop at the first match that ends past the boundary.
+        let mut finalized = 0usize;
+        let mut cursor = 0usize;
+        for m in &self.matched[..self.frozen_count] {
+            let start_pos = cursor
+                + self.seq_index[cursor..]
+                    .iter()
+                    .position(|&s| s == m.start_seq)
+                    .expect("finalized match start seq must still be fed");
+            let end_pos = start_pos + m.labels.len();
+            if end_pos <= final_pos {
+                finalized += 1;
+                // Later matches start strictly after this one (`resume > start`), so search forward.
+                cursor = start_pos + 1;
+            } else {
+                debug_assert!(
+                    start_pos >= final_pos,
+                    "match [{start_pos}, {end_pos}) straddles finalization boundary {final_pos}"
+                );
+                break;
+            }
+        }
+
+        // Detach the finalized matches (scan order, seqs intact) and rebase the buffer.
+        let removed: Vec<SeqMatch> = self.matched.drain(..finalized).collect();
+        self.frozen_count -= finalized;
+        self.next_pos -= final_pos;
+        self.seq_index.drain(..final_pos);
+        removed
+    }
+
     /// Current provisional matches over everything fed so far, as if input ended now.
     pub fn provisional(&self) -> &[SeqMatch] {
         &self.matched
@@ -282,7 +355,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{IncrementalMatcher, SeqMatch};
-    use crate::executor::match_recognize::nfa::{Nfa, Pattern, Quantifier, SetMatcher, SkipMode};
+    use crate::executor::error::StreamExecutorResult;
+    use crate::executor::match_recognize::nfa::{
+        CandidateMatcher, Nfa, Pattern, Quantifier, SetMatcher, SkipMode,
+    };
 
     /// Oracle: feeding rows incrementally (in any split) must equal one batch
     /// `find_matches_dynamic` over the same rows.
@@ -842,5 +918,256 @@ mod tests {
             provisional_triples(&inc),
             batch_triples(&nfa, &skip, &rows).await
         );
+    }
+
+    /// `SeqMatch`es (e.g. the finalized-and-returned ones) as `(start, end, labels)` triples, so
+    /// they line up with the position-anchored batch oracle (seqs equal final sorted positions in
+    /// these tests).
+    fn seq_triples(ms: &[SeqMatch]) -> Vec<(usize, usize, Vec<String>)> {
+        ms.iter()
+            .map(|m| (m.start_seq as usize, m.end_seq as usize, m.labels.clone()))
+            .collect()
+    }
+
+    /// Generic oracle: feeding rows incrementally (in any split) through `matcher` must equal one
+    /// batch `find_matches_dynamic` with the *same* `matcher`. Unlike [`assert_equiv`] this takes an
+    /// arbitrary [`CandidateMatcher`] (not just [`SetMatcher`]), so a matcher that applies its own
+    /// pruning — e.g. the `WITHIN` span prune — can be driven through the incremental path.
+    async fn assert_equiv_with<M: CandidateMatcher + Sync>(
+        nfa: &Nfa,
+        skip: SkipMode,
+        n_rows: usize,
+        matcher: &M,
+        split_at: &[usize],
+    ) {
+        let batch: Vec<(usize, usize, Vec<String>)> = nfa
+            .find_matches_dynamic(n_rows, matcher, &skip)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| (m.start, m.end, m.labels.clone()))
+            .collect();
+        let mut inc = IncrementalMatcher::new(nfa, skip.clone());
+        let mut fed = 0usize;
+        for &cut in split_at.iter().chain(std::iter::once(&n_rows)) {
+            let seqs: Vec<i64> = (fed..cut).map(|i| i as i64).collect();
+            inc.advance(&seqs, matcher).await.unwrap();
+            fed = cut;
+        }
+        assert_eq!(provisional_triples(&inc), batch);
+    }
+
+    /// A [`CandidateMatcher`] that models the `WITHIN` span prune the executor applies inside
+    /// `DefineMatcher::matches` (see `executor.rs`): binding a candidate at `pos` extends the match
+    /// to span `[match_start, pos]`, and the executor rejects the candidate when that span exceeds
+    /// the bound, so the NFA backtracks to the longest match that fits the window. `WITHIN` lives
+    /// entirely inside the `CandidateMatcher`; this module has no `WITHIN` logic of its own — it
+    /// hands the matcher straight to `find_matches_dynamic` and `reaches_boundary_alive` — so
+    /// driving a span-pruning matcher through the incremental path and checking equality with the
+    /// batch path proves the pass-through. (`nfa.rs`'s `SetMatcher` has no `WITHIN`, and the real
+    /// `DefineMatcher` needs the executor's expression/row machinery, so we model the prune here.)
+    struct WithinSetMatcher {
+        rows: Vec<BTreeSet<String>>,
+        /// Max span in order-key units. Seqs equal positions here, so the span of a candidate at
+        /// `pos` is `pos - match_start == labels.len()`.
+        max_span: usize,
+    }
+
+    impl CandidateMatcher for WithinSetMatcher {
+        async fn matches(
+            &self,
+            var: &str,
+            pos: usize,
+            labels: &[String],
+        ) -> StreamExecutorResult<bool> {
+            if !self.rows[pos].contains(var) {
+                return Ok(false);
+            }
+            let match_start = pos - labels.len();
+            Ok(pos - match_start <= self.max_span)
+        }
+    }
+
+    /// (a) Finalize mid-stream, then keep feeding: the finalized prefix is removed from and returned
+    /// out of the diffable set, `provisional()` keeps only the still-revisable matches, and the
+    /// union `provisional() ∪ returned` equals the batch oracle over all rows — with the rebased
+    /// bookkeeping proven by advancing further after the finalization and still matching the oracle.
+    #[tokio::test]
+    async fn finalize_removes_prefix_and_rebases_bookkeeping() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        // 0:a 1:b 2:x 3:a 4:b 5:x 6:a 7:b 8:x  -> batch matches (0,2),(3,5),(6,8).
+        let full = from_str("abxabxabx");
+        let m_full = SetMatcher::new(full.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3, 4, 5], &m_full).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (3, 5, labels(&["a", "b"]))]
+        );
+        assert_eq!(inc.frozen(), 2);
+
+        // Finalize everything before seq 3 (evict sorted positions [0,3)): removes the wholly-inside
+        // match (0,2); (3,5) starts at the boundary and is kept.
+        let removed = inc.finalize_before_seq(3);
+        assert_eq!(seq_triples(&removed), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(provisional_triples(&inc), vec![(3, 5, labels(&["a", "b"]))]);
+        assert_eq!(inc.frozen(), 1);
+
+        // Keep feeding rows 6,7,8. Their buffer positions are now rebased (row 3 sits at position 0),
+        // so the matcher indexes the surviving buffer `full[3..]`.
+        let m_tail = SetMatcher::new(full[3..].to_vec());
+        inc.advance(&[6, 7, 8], &m_tail).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(3, 5, labels(&["a", "b"])), (6, 8, labels(&["a", "b"]))]
+        );
+
+        // Union of the returned finalized match and the surviving provisional set equals the batch
+        // oracle over the whole run.
+        let mut union = seq_triples(&removed);
+        union.extend(provisional_triples(&inc));
+        assert_eq!(union, batch_triples(&nfa, &skip, &full).await);
+    }
+
+    /// (a) Bookkeeping consistency across *all three* operations after a finalization: finalize a
+    /// prefix, advance to derive more matches, then take a late (out-of-order) row that reinserts
+    /// into the already-rebased tail — `truncate_from_seq` + re-feed — and the union still equals the
+    /// batch oracle over the corrected full sequence. Exercises seq→position mapping against the
+    /// rebased `seq_index` in both `advance` and `truncate_from_seq`.
+    #[tokio::test]
+    async fn finalize_then_truncate_and_advance_equals_batch() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        // 0:a 1:b 2:x 3:a 4:b 5:x 6:a 7:b 8:x
+        let pre = from_str("abxabxabx");
+        let m_pre = SetMatcher::new(pre.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3, 4, 5, 6, 7, 8], &m_pre).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![
+                (0, 2, labels(&["a", "b"])),
+                (3, 5, labels(&["a", "b"])),
+                (6, 8, labels(&["a", "b"])),
+            ]
+        );
+        assert_eq!(inc.frozen(), 3);
+
+        // Finalize before seq 3 (evict [0,3)); returns (0,2), rebases so row 3 is now position 0.
+        let removed = inc.finalize_before_seq(3);
+        assert_eq!(seq_triples(&removed), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(3, 5, labels(&["a", "b"])), (6, 8, labels(&["a", "b"]))]
+        );
+
+        // A late {a} sorts at global position 6 (before old row 6): old row 6 (seq 6) is the first
+        // buffered row whose sorted position changes, so the caller truncates at seq 6. The matcher
+        // indexes the rebased surviving buffer `pre[3..]`.
+        let m_pre_tail = SetMatcher::new(pre[3..].to_vec());
+        inc.truncate_from_seq(6, &m_pre_tail).await.unwrap();
+        // (3,5) survives (its region is dead at the truncation boundary); (6,8) reaches past it and
+        // is dropped, to be re-derived by the re-feed.
+        assert_eq!(provisional_triples(&inc), vec![(3, 5, labels(&["a", "b"]))]);
+
+        // Corrected full sequence with the late {a} inserted at position 6:
+        // 0:a 1:b 2:x 3:a 4:b 5:x 6:a 7:a 8:b 9:x  -> batch (0,2),(3,5),(7,9).
+        let corrected = from_str("abxabxaabx");
+        // Re-feed the sorted suffix from global position 6 (seqs 6..=9), matcher over the rebased
+        // surviving buffer `corrected[3..]`.
+        let m_corr_tail = SetMatcher::new(corrected[3..].to_vec());
+        inc.advance(&[6, 7, 8, 9], &m_corr_tail).await.unwrap();
+
+        let mut union = seq_triples(&removed);
+        union.extend(provisional_triples(&inc));
+        assert_eq!(union, batch_triples(&nfa, &skip, &corrected).await);
+    }
+
+    /// (a) Robustness: a seq that was never fed is a no-op, and finalizing before the very first row
+    /// (`final_pos == 0`) evicts nothing. Neither may touch state, and later appends still equal the
+    /// batch.
+    #[tokio::test]
+    async fn finalize_unknown_or_zero_seq_is_noop() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        let rows = from_str("abxab");
+        let matcher = SetMatcher::new(rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3], &matcher).await.unwrap();
+        let before = inc.provisional().to_vec();
+        let before_frozen = inc.frozen();
+
+        assert_eq!(inc.finalize_before_seq(99), vec![]); // never fed
+        assert_eq!(inc.finalize_before_seq(0), vec![]); // final_pos == 0, evict nothing
+        assert_eq!(inc.provisional(), before.as_slice());
+        assert_eq!(inc.frozen(), before_frozen);
+
+        inc.advance(&[4], &matcher).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &rows).await
+        );
+    }
+
+    /// (b) `WITHIN` parity: a matcher that applies the `WITHIN` span prune drives identically through
+    /// the incremental path and the batch path. `a b+` with a max span of one row (so a match may
+    /// span at most two rows, `a b`) over `abbabb`: without `WITHIN` the greedy `b+` swallows both
+    /// `b`s per match; `WITHIN` caps each match at `ab`. The incremental path must track that through
+    /// both matching and the freeze-gate liveness check — proving pass-through, since this module has
+    /// no `WITHIN` logic of its own.
+    #[tokio::test]
+    async fn within_span_prune_incremental_equals_batch() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let rows = from_str("abbabb");
+        let matcher = WithinSetMatcher {
+            rows: rows.clone(),
+            max_span: 1,
+        };
+        for split in [
+            &[1][..],
+            &[2][..],
+            &[3][..],
+            &[1, 2, 3, 4, 5][..],
+            &[2, 4][..],
+        ] {
+            assert_equiv_with(&nfa, SkipMode::PastLastRow, rows.len(), &matcher, split).await;
+        }
+    }
+
+    /// (c) Finalization must never reach into the open (non-frozen) trailing region: the boundary
+    /// has to lie within the frozen prefix. `a b+` fed one row at a time keeps its trailing greedy
+    /// match alive at the buffer end forever, so nothing freezes (`next_pos == 0`). Finalizing before
+    /// seq 2 (a position past the frozen prefix) must trip the debug assertion.
+    #[tokio::test]
+    #[should_panic(expected = "frozen prefix")]
+    async fn finalize_into_open_region_panics() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let rows = from_str("abb");
+        let matcher = SetMatcher::new(rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, SkipMode::PastLastRow);
+        inc.advance(&[0, 1, 2], &matcher).await.unwrap();
+        // Trailing greedy match (0,3) stays alive at the boundary: nothing frozen.
+        assert_eq!(inc.frozen(), 0);
+        // seq 2 sits at position 2, past the frozen prefix (next_pos == 0): must panic.
+        inc.finalize_before_seq(2);
     }
 }
