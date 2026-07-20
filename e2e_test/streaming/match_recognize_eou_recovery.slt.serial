@@ -1,0 +1,202 @@
+# Recovery test for streaming MATCH_RECOGNIZE emit-on-update (EOU) mode: the in-memory diff base
+# (`last_emitted`) is a pure derivation of the buffer state table and must be rebuilt SILENTLY on
+# recovery -- recomputing each owned partition's provisional set and seeding the base without
+# emitting anything. If the rebuild skipped a partition (or the base were left empty and re-diffed
+# against fresh input), downstream would see either a lost match or a duplicate Insert of a match it
+# already holds.
+#
+# Single source parallelism so the watermark advances deterministically: with a parallel source the
+# watermark is the min across partitions, and a single high-ts sentinel would not advance it on a
+# multi-node cluster. (All the other MATCH_RECOGNIZE e2e tests set this for the same reason.)
+
+statement ok
+set streaming_parallelism = 1;
+
+statement ok
+set rw_implicit_flush to true;
+
+statement ok
+drop materialized view if exists mv_eou_recover;
+
+statement ok
+drop table if exists t_eou_recover;
+
+statement ok
+drop materialized view if exists mv_eou_idle_recover;
+
+statement ok
+drop table if exists t_eou_idle_recover;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario A: provisional -> recover -> revise -> finalize.
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_recover (id int, ts int, v int, watermark for ts as ts - 10) append only;
+
+statement ok
+create materialized view mv_eou_recover as
+select * from t_eou_recover match_recognize (
+  partition by id
+  order by ts
+  measures count(*) as n, last(b.v) as bv
+  one row per match
+  after match skip past last row
+  pattern (a b+)
+  within 100
+  define a as a.v > 0, b as b.v < 0
+);
+
+# PROVISIONAL: whole-buffer diff at the barrier this insert implicitly flushes.
+statement ok
+insert into t_eou_recover values (1, 1, 5), (1, 2, -1);
+
+query II rowsort
+select n, bv from mv_eou_recover;
+----
+2 -1
+
+statement ok
+recover;
+
+statement ok
+wait;
+
+# `recover` resets session state, so re-enable implicit flush for synchronous inserts below.
+statement ok
+set rw_implicit_flush to true;
+
+# Post-recovery watermark/cache processing is asynchronous relative to `wait` (existing lesson from
+# the EOWC recovery serial); give it a margin before the first post-recovery query.
+sleep 3s
+
+# UNCHANGED: the rebuild recomputed the same provisional set from the recovered buffer and silently
+# reseeded the diff base -- byte-identical to the pre-crash row, nothing re-emitted or lost.
+query II rowsort
+select n, bv from mv_eou_recover;
+----
+2 -1
+
+# REVISED: greedy `b+` extension after recovery. Same `_match_id` (same start row) as the row above.
+statement ok
+insert into t_eou_recover values (1, 3, -2);
+
+sleep 3s
+
+query II rowsort
+select n, bv from mv_eou_recover;
+----
+3 -2
+
+# FINALIZED: sentinel (partition 2, ts 300) advances the watermark to 290, past this match's WITHIN
+# deadline (1 + 100 = 101). The match's rows evict; the row itself is never retracted.
+statement ok
+insert into t_eou_recover values (2, 300, 5);
+
+sleep 3s
+
+query II rowsort
+select n, bv from mv_eou_recover where n is not null and bv is not null;
+----
+3 -2
+
+statement ok
+drop materialized view mv_eou_recover;
+
+statement ok
+drop table t_eou_recover;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario B: idle partition holding an emitted boundary-complete match with NO pending wakeup
+# (deliberately no WITHIN clause) -- the Task-8 missed-enumeration shape. Recovery must rebuild the
+# diff base by scanning the buffer table itself, not the wakeup-frontier index: a boundary-complete
+# match under an open quantifier (`b+`) with no WITHIN deadline and no future row keeps its buffer
+# alive (`reaches_boundary_alive`) while its frontier entry is removed (no scheduled wakeup remains).
+# Enumerating recovery from the frontier would silently skip this partition, leaving the diff base
+# without it; the next revision would then emit a bare Insert colliding with the `_match_id` the MV
+# already holds from before the crash, instead of a clean Delete/Insert.
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_idle_recover (id int, ts int, v int, watermark for ts as ts - 1) append only;
+
+statement ok
+create materialized view mv_eou_idle_recover as
+select * from t_eou_idle_recover match_recognize (
+  partition by id
+  order by ts
+  measures count(*) as n, last(b.v) as dip
+  one row per match
+  after match skip past last row
+  pattern (a b+)
+  define a as a.v > 0, b as b.v < 0
+);
+
+# Partition 1: a@10 (v=5), b@11 (v=-1) -- a boundary-complete (a b+) match, emitted at this barrier.
+statement ok
+insert into t_eou_idle_recover values (1, 10, 5), (1, 11, -1);
+
+query II rowsort
+select n, dip from mv_eou_idle_recover;
+----
+2 -1
+
+# Sentinel (partition 9, ts 12) advances the watermark to 11 -- past BOTH of partition 1's rows, so
+# safe_len == rows.len() for it. The match is held alive (the open `b+` quantifier could still
+# extend it, so `reaches_boundary_alive` keeps its start), so nothing evicts; but with no WITHIN
+# deadline and no future row to wait for, the watermark arm's frontier recompute finds neither a
+# row-wakeup nor a within-wakeup and removes partition 1's frontier entry -- even though its buffer,
+# and its already-emitted match, survive untouched.
+statement ok
+insert into t_eou_idle_recover values (9, 12, 0);
+
+query II rowsort
+select n, dip from mv_eou_idle_recover;
+----
+2 -1
+
+statement ok
+recover;
+
+statement ok
+wait;
+
+statement ok
+set rw_implicit_flush to true;
+
+sleep 3s
+
+# UNCHANGED: rebuilding from the buffer table (not the now-absent frontier entry) still finds
+# partition 1's live rows and silently reseeds its emitted match -- nothing re-emitted, nothing lost.
+query II rowsort
+select n, dip from mv_eou_idle_recover;
+----
+2 -1
+
+# Extend the SAME match after recovery with a second `b` row: a genuine revision, same `_match_id`
+# (same start row) as the row above.
+statement ok
+insert into t_eou_idle_recover values (1, 13, -2);
+
+sleep 3s
+
+# EXACTLY ONCE: the revised row replaces the prior one via a proper Delete/Insert pair -- one row,
+# with the revised content. Had the rebuild enumerated via the (now-absent) frontier entry instead of
+# the buffer table, the diff base would have lacked this partition, and this revision would have
+# emitted a bare Insert colliding with the `_match_id` the MV already held -- a duplicate, not a
+# clean update.
+query II rowsort
+select n, dip from mv_eou_idle_recover;
+----
+3 -2
+
+query I
+select count(*) from mv_eou_idle_recover;
+----
+1
+
+statement ok
+drop materialized view mv_eou_idle_recover;
+
+statement ok
+drop table t_eou_idle_recover;

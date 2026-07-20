@@ -1,0 +1,209 @@
+# Streaming MATCH_RECOGNIZE, emit-on-update (EOU) mode: the plain form (no EMIT ON WINDOW CLOSE)
+# emits a provisional changelog at every barrier, computed over the WHOLE buffer (as if input ended
+# now), not just the watermark-safe prefix. A match's identity (`_match_id`, hidden) is its start
+# row's sequence number, so a greedy extension revises the SAME row (Delete old / Insert new) rather
+# than appearing as a second row. The watermark still drives finalization: once it passes a match's
+# structural-death or WITHIN-expiry point, the match's rows are evicted and it is dropped from the
+# diff base WITHOUT a retraction (a finalized match is a permanent, already-emitted result).
+#
+# Three independent scenarios, each on its own table/MV:
+#   1. lifecycle: provisional -> revised (greedy extension) -> finalized (watermark past deadline).
+#   2. cascade: a late out-of-order row re-partitions two overlapping matches under SKIP TO NEXT ROW,
+#      revising one match's content while introducing a brand-new one.
+#   3. I2 regression: a match's rows arrive AND become watermark-safe-and-evicted within a SINGLE
+#      barrier, with no earlier barrier ever having diffed the partition. The watermark path must
+#      emit the whole-buffer diff before eviction, or the match is silently lost.
+#
+# Self-cleaning: guard re-runs with `drop ... if exists` up front, since a failing assertion aborts
+# before that block's own drops.
+
+statement ok
+set streaming_parallelism = 1;
+
+statement ok
+drop materialized view if exists mv_eou_lifecycle;
+
+statement ok
+drop table if exists t_eou_lifecycle;
+
+statement ok
+drop materialized view if exists mv_eou_cascade;
+
+statement ok
+drop table if exists t_eou_cascade;
+
+statement ok
+drop materialized view if exists mv_eou_i2;
+
+statement ok
+drop table if exists t_eou_i2;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario 1: lifecycle -- provisional, revised, finalized.
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_lifecycle (id int, ts int, v int, watermark for ts as ts - 10) append only;
+
+statement ok
+create materialized view mv_eou_lifecycle as
+select * from t_eou_lifecycle match_recognize (
+  partition by id
+  order by ts
+  measures count(*) as n, last(b.v) as bv
+  one row per match
+  after match skip past last row
+  pattern (a b+)
+  within 100
+  define a as a.v > 0, b as b.v < 0
+);
+
+statement ok
+insert into t_eou_lifecycle values (1, 1, 5), (1, 2, -1);
+
+statement ok
+flush;
+
+# PROVISIONAL: whole-buffer diff at this barrier. No watermark movement past these rows at all --
+# the row is visible purely because the barrier emitted it, not because anything finalized.
+query II
+select n, bv from mv_eou_lifecycle;
+----
+2 -1
+
+statement ok
+insert into t_eou_lifecycle values (1, 3, -2);
+
+statement ok
+flush;
+
+# REVISED: greedy `b+` extension. Same `_match_id` (same start row) as the row above; the diff is a
+# Delete of the old content plus an Insert of the new -- content-level revision, not a second row.
+query II
+select n, bv from mv_eou_lifecycle;
+----
+3 -2
+
+statement ok
+insert into t_eou_lifecycle values (2, 300, 5);
+
+statement ok
+flush;
+
+# FINALIZED: the sentinel (partition 2, ts 300) advances the watermark to 290 -- past this match's
+# WITHIN deadline (1 + 100 = 101). The watermark arm's WITHIN-final boundary logic now evicts the
+# match's rows and drops it from the diff base, but the row itself is never retracted: it stays
+# stable, byte-identical to the revised state above.
+query II
+select n, bv from mv_eou_lifecycle where n is not null and bv is not null;
+----
+3 -2
+
+statement ok
+drop materialized view mv_eou_lifecycle;
+
+statement ok
+drop table t_eou_lifecycle;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario 2: retraction cascade -- a late out-of-order row re-partitions overlapping matches under
+# AFTER MATCH SKIP TO NEXT ROW.
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_cascade (id int, ts int, v int, watermark for ts as ts - 10) append only;
+
+statement ok
+create materialized view mv_eou_cascade as
+select * from t_eou_cascade match_recognize (
+  partition by id
+  order by ts
+  measures first(a.ts) as first_ts, last(a.ts) as last_ts
+  one row per match
+  after match skip to next row
+  pattern (a a)
+  define a as a.v > 0
+);
+
+# Two rows, both `a` (ts 1, ts 3): only one (a a) match possible over the two-row buffer.
+statement ok
+insert into t_eou_cascade values (1, 1, 5), (1, 3, 6);
+
+statement ok
+flush;
+
+# PROVISIONAL: one match spanning the only two buffered rows.
+query II
+select first_ts, last_ts from mv_eou_cascade;
+----
+1 3
+
+# Late, out-of-order row (ts = 2) arrives well within the lateness (10) of the buffer's max ts (3),
+# so it is buffered, not dropped. It slots between the two existing rows in ORDER BY order.
+statement ok
+insert into t_eou_cascade values (1, 2, 7);
+
+statement ok
+flush;
+
+# CASCADED REVISION: SKIP TO NEXT ROW over the re-sorted 3-row buffer now finds TWO overlapping
+# matches -- (ts1,ts2) and (ts2,ts3) -- instead of one. The match starting at ts=1 keeps its identity
+# (same start row/`_match_id`) but its content changes (last_ts 3 -> 2): a Delete/Insert pair, not a
+# second row. The match starting at ts=2 is brand new (its start row was just inserted): a pure
+# Insert. Assert the full revised SET (both rows' content), not just a row count.
+query II rowsort
+select first_ts, last_ts from mv_eou_cascade;
+----
+1 2
+2 3
+
+statement ok
+drop materialized view mv_eou_cascade;
+
+statement ok
+drop table t_eou_cascade;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario 3: I2 regression -- same-epoch finalize-before-emit.
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_i2 (id int, ts int, v int, watermark for ts as ts - 1) append only;
+
+statement ok
+create materialized view mv_eou_i2 as
+select * from t_eou_i2 match_recognize (
+  partition by id
+  order by ts
+  measures count(*) as n, last(b.v) as dip
+  one row per match
+  after match skip past last row
+  pattern (a b)
+  within 1
+  define a as a.v > 0, b as b.v < 0
+);
+
+# The completing rows (a@1, b@2 -- span 1, exactly the WITHIN bound) and a cross-partition sentinel
+# (id 2, ts 3) that advances the watermark to 2 -- exactly this match's WITHIN deadline (1 + 1) --
+# all arrive in ONE statement, before a SINGLE flush. Within that one epoch (Chunk -> Watermark ->
+# Barrier), the match becomes watermark-safe AND is fully evicted by the watermark arm's WITHIN-final
+# boundary logic, with NO earlier barrier ever having diffed this partition (this is the first chunk
+# it ever received). The watermark arm must run the whole-buffer emit-before-evict diff first, or the
+# match is evicted with nothing downstream having ever seen it -- permanently lost. Assert the row IS
+# present.
+statement ok
+insert into t_eou_i2 values (1, 1, 5), (1, 2, -1), (2, 3, 0);
+
+statement ok
+flush;
+
+query II
+select n, dip from mv_eou_i2;
+----
+2 -1
+
+statement ok
+drop materialized view mv_eou_i2;
+
+statement ok
+drop table t_eou_i2;

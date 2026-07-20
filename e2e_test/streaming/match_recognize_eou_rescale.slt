@@ -1,0 +1,130 @@
+# Streaming MATCH_RECOGNIZE emit-on-update (EOU) across a rescale -- the EOU mirror of
+# match_recognize_rescale.slt. Under EOU the executor holds two in-memory derivations of the buffer
+# state table: the per-partition matcher cache and the diff base (`last_emitted`, what downstream was
+# last told). On a vnode-bitmap change (ALTER ... SET PARALLELISM) both are dropped, and the diff
+# base must be rebuilt SILENTLY from the now-owned buffers before any further emission: downstream
+# still holds every re-homed partition's provisional rows from the pre-rescale actor, so re-diffing
+# against an empty base would duplicate-Insert rows downstream already has (same hidden `_match_id`),
+# while emitting nothing at all on the next revision would lose the Delete half of the update.
+#
+# Detector shape mirrors match_recognize_rescale.slt, with two deliberate changes: `b+` instead of
+# `b` (so a post-rescale row can EXTEND a match -- a fixed (a b) match cannot be revised), and a
+# WITHIN bound (a boundary-complete match under an open quantifier with no WITHIN is held forever
+# and can never finalize; the WITHIN deadline is what lets the final sentinel finalize it).
+
+statement ok
+set rw_implicit_flush to true;
+
+statement ok
+set streaming_parallelism = 1;
+
+statement ok
+drop materialized view if exists mv_eou_rescale;
+
+statement ok
+drop table if exists t_eou_rescale;
+
+statement ok
+create table t_eou_rescale (id int, t int, v int, watermark for t as t - 10) append only;
+
+statement ok
+create materialized view mv_eou_rescale as
+select * from t_eou_rescale match_recognize (
+  partition by id
+  order by t
+  measures count(*) as n, last(b.v) as bv
+  one row per match
+  after match skip past last row
+  pattern (a b+)
+  within 100
+  define a as a.v > 0, b as b.v < 0
+);
+
+# Complete provisional (a b+) matches in 5 partitions while parallelism is 1. The watermark stays at
+# 2 - 10 = -8 -- far before every row -- so nothing is finalized or evicted: these rows are visible
+# purely through the barrier's whole-buffer provisional diff.
+statement ok
+insert into t_eou_rescale values
+  (1, 1, 5), (1, 2, -1),
+  (2, 1, 5), (2, 2, -1),
+  (3, 1, 5), (3, 2, -1),
+  (4, 1, 5), (4, 2, -1),
+  (5, 1, 5), (5, 2, -1);
+
+# PRE-RESCALE PROVISIONAL: one match per partition, emitted at the implicit-flush barrier.
+query III rowsort
+select * from mv_eou_rescale;
+----
+1 2 -1
+2 2 -1
+3 2 -1
+4 2 -1
+5 2 -1
+
+# Rescale MID-PROVISIONAL: the partitions' vnodes reassign across 4 actors while every match is
+# still provisional (nothing finalized). Each new owner must drop its matcher cache and silently
+# rebuild its diff base from the buffers it now owns (the vnode path of the recovery/rescale
+# rebuild), emitting nothing.
+statement ok
+alter materialized view mv_eou_rescale set parallelism = 4;
+
+# Force a barrier through the rescaled graph before asserting, so a buggy NON-silent rebuild (one
+# that diffed the re-homed buffers against an empty base and re-Inserted) would have had its chance
+# to emit.
+statement ok
+flush;
+
+# POST-RESCALE, UNCHANGED: exactly the same five provisional rows, each exactly once. Duplicates
+# here = the rebuild re-emitted rows downstream already held; losses = re-homed buffers were not
+# rescanned at all.
+query III rowsort
+select * from mv_eou_rescale;
+----
+1 2 -1
+2 2 -1
+3 2 -1
+4 2 -1
+5 2 -1
+
+query I
+select count(*) from mv_eou_rescale;
+----
+5
+
+# REVISION ON A NEW OWNER: extend partition 1's match with a second `b` row. The post-rescale owner
+# rebuilt partition 1's matcher and diff base from the state table, so this diffs as a clean
+# Delete(2,-1)/Insert(3,-2) pair on the SAME hidden `_match_id` (same start row). Had the rebuild
+# been skipped (diff base left empty), this would instead emit a bare Insert colliding with the
+# `_match_id` the MV already holds from the pre-rescale actor's emission.
+statement ok
+insert into t_eou_rescale values (1, 3, -2);
+
+query III rowsort
+select * from mv_eou_rescale;
+----
+1 3 -2
+2 2 -1
+3 2 -1
+4 2 -1
+5 2 -1
+
+# FINALIZE: the sentinel (partition 0, t 1000) advances the watermark to 990, past every match's
+# WITHIN deadline (1 + 100 = 101). All five matches finalize on their post-rescale owners: rows
+# evict, the matches drop out of the diff base without a retraction, and the MV rows stay stable.
+statement ok
+insert into t_eou_rescale values (0, 1000, 0);
+
+query III rowsort
+select * from mv_eou_rescale where n is not null;
+----
+1 3 -2
+2 2 -1
+3 2 -1
+4 2 -1
+5 2 -1
+
+statement ok
+drop materialized view mv_eou_rescale;
+
+statement ok
+drop table t_eou_rescale;
