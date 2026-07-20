@@ -38,7 +38,8 @@ pub struct StreamMatchRecognize {
     pub base: PlanBase<Stream>,
     core: generic::MatchRecognize<PlanRef<Stream>>,
     /// Whether this node plans in Emit-On-Update mode (the plain form, without `EMIT ON WINDOW
-    /// CLOSE`). Stored for `try_to_stream_prost_body`; the executor does not yet act on it.
+    /// CLOSE`). Forwarded through `try_to_stream_prost_body`; in this mode the executor emits a
+    /// provisional-match changelog at each barrier and suppresses watermark-time emission.
     emit_on_update: bool,
 }
 
@@ -51,9 +52,9 @@ impl StreamMatchRecognize {
         let n_part = core.partition_by.len();
         let dist = Distribution::HashShard((0..n_part).collect());
         let (stream_kind, eowc) = if emit_on_update {
-            // Emit-On-Update mode: provisional matches are corrected by retractions, so the output
-            // is a retract stream. The executor does not emit retractions yet (a later change wires
-            // the behavior), but the plan already declares the mode it is heading towards.
+            // Emit-On-Update mode: at each barrier the executor diffs every touched partition's
+            // provisional match set against what it last emitted and emits the Delete/Insert
+            // corrections, so the output is a retract stream.
             (StreamKind::Retract, false)
         } else {
             // Emit-On-Window-Close mode: the operator emits only FINAL matches, at the watermark —

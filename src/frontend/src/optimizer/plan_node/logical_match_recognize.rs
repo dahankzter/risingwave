@@ -201,10 +201,10 @@ impl ToStream for LogicalMatchRecognize {
         use super::StreamMatchRecognize;
 
         // `EMIT ON WINDOW CLOSE` selects Emit-On-Window-Close mode: the operator buffers rows and
-        // emits only final matches, at the watermark. Its absence selects Emit-On-Update mode: the
-        // operator emits provisional matches as rows become safe and corrects them with retractions
-        // as later rows or the watermark revise the match. (The executor does not emit retractions
-        // yet — a later change wires the behavior — but the plan already plans for the mode.)
+        // emits only final matches, at the watermark. Its absence selects Emit-On-Update mode: at
+        // each barrier the operator emits its provisional matches as a retract stream, diffing the
+        // current match set of every touched partition against what it last emitted and correcting
+        // earlier rows with retractions as later input or the watermark revise the match.
         let emit_on_update = !ctx.emit_on_window_close();
 
         // v1 restrictions: PARTITION BY / ORDER BY must be plain columns, PARTITION BY non-empty.

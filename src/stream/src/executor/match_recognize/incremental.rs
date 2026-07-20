@@ -41,6 +41,11 @@
 //! sound against the boundary it was checked at), after which the caller re-feeds the corrected
 //! sorted suffix through `advance`.
 
+use std::cmp::Ordering;
+
+use risingwave_common::array::Op;
+use risingwave_common::row::OwnedRow;
+
 use crate::executor::error::StreamExecutorResult;
 use crate::executor::match_recognize::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipMode};
 
@@ -53,6 +58,75 @@ pub struct SeqMatch {
     pub start_seq: i64,
     pub end_seq: i64,
     pub labels: Vec<String>,
+}
+
+/// Diff two provisional match sets — each a `(match, output row)` list, in **any order** — into the
+/// changelog ops that turn `old` into `new`. Match identity is `start_seq` (the emitted
+/// `_match_id`):
+///
+/// * a match in `old` but not `new` (its start vanished) → `Delete` of its old row;
+/// * a match in `new` but not `old` (a brand-new start) → `Insert` of its new row;
+/// * a match present in both whose extent (`end_seq`), labels, or output row changed →
+///   `Delete(old)` then `Insert(new)`;
+/// * an unchanged match → no ops.
+///
+/// Ops come out start-seq ascending, `Delete` before `Insert` for a revised identity — the retract
+/// encoding of an update to a `_match_id` key.
+///
+/// The sort-by-identity the merge needs is enforced *here*, not assumed of the caller: the executor
+/// hands over [`IncrementalMatcher::provisional`]-derived lists, which are in the matcher's scan
+/// (buffer-position) order — and under out-of-order arrival that is **not** start-seq order, because
+/// seqs are minted at arrival, so a late row that sorts earlier carries a *higher* seq at an
+/// *earlier* position. A merge over such inputs would pair unrelated identities (net-deleting a
+/// match that is still in `new`).
+pub fn diff_provisional(
+    old: &[(SeqMatch, OwnedRow)],
+    new: &[(SeqMatch, OwnedRow)],
+) -> Vec<(Op, OwnedRow)> {
+    // Start seqs are unique within one provisional set (matches start at distinct rows), so this is
+    // a total order on each side and the linear merge below is well-defined.
+    let mut old_sorted: Vec<&(SeqMatch, OwnedRow)> = old.iter().collect();
+    old_sorted.sort_by_key(|(m, _)| m.start_seq);
+    let mut new_sorted: Vec<&(SeqMatch, OwnedRow)> = new.iter().collect();
+    new_sorted.sort_by_key(|(m, _)| m.start_seq);
+
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < old_sorted.len() && j < new_sorted.len() {
+        let (om, orow) = old_sorted[i];
+        let (nm, nrow) = new_sorted[j];
+        match om.start_seq.cmp(&nm.start_seq) {
+            // `old`'s start sorts first and has no `new` counterpart: it vanished.
+            Ordering::Less => {
+                ops.push((Op::Delete, orow.clone()));
+                i += 1;
+            }
+            // `new`'s start sorts first and has no `old` counterpart: it is brand new.
+            Ordering::Greater => {
+                ops.push((Op::Insert, nrow.clone()));
+                j += 1;
+            }
+            // Same identity: emit a Delete+Insert pair when the extent, labels, or output row
+            // changed; nothing when the match is byte-for-byte unchanged.
+            Ordering::Equal => {
+                if om.end_seq != nm.end_seq || om.labels != nm.labels || orow != nrow {
+                    ops.push((Op::Delete, orow.clone()));
+                    ops.push((Op::Insert, nrow.clone()));
+                }
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    // Only one side can have leftovers; their start_seqs all exceed everything emitted so far, so
+    // appending them (deletes for `old`, inserts for `new`) keeps the run start-seq ascending.
+    for (_, orow) in &old_sorted[i..] {
+        ops.push((Op::Delete, orow.clone()));
+    }
+    for (_, nrow) in &new_sorted[j..] {
+        ops.push((Op::Insert, nrow.clone()));
+    }
+    ops
 }
 
 /// Incremental wrapper around [`Nfa::find_matches_dynamic`] for append-only input.
@@ -370,11 +444,135 @@ impl IncrementalMatcher {
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{IncrementalMatcher, SeqMatch};
+    use risingwave_common::array::Op;
+    use risingwave_common::row::OwnedRow;
+    use risingwave_common::types::ScalarImpl;
+
+    use super::{IncrementalMatcher, SeqMatch, diff_provisional};
     use crate::executor::error::StreamExecutorResult;
     use crate::executor::match_recognize::nfa::{
         CandidateMatcher, Nfa, Pattern, Quantifier, SetMatcher, SkipMode,
     };
+
+    /// A `SeqMatch` with the given extent and labels (identity is `start`).
+    fn dm(start: i64, end: i64, ls: &[&str]) -> SeqMatch {
+        SeqMatch {
+            start_seq: start,
+            end_seq: end,
+            labels: labels(ls),
+        }
+    }
+
+    /// A one-column output row carrying `v`, so distinct rows are easy to assert on.
+    fn orow(v: i64) -> OwnedRow {
+        OwnedRow::new(vec![Some(ScalarImpl::Int64(v))])
+    }
+
+    #[test]
+    fn diff_emits_delete_insert_for_revision() {
+        // start 5 revised: end 7 (row A) -> end 9 (row B). Delete(A) then Insert(B).
+        let old = vec![(dm(5, 7, &["a", "b"]), orow(100))];
+        let new = vec![(dm(5, 9, &["a", "b", "b"]), orow(200))];
+        assert_eq!(
+            diff_provisional(&old, &new),
+            vec![(Op::Delete, orow(100)), (Op::Insert, orow(200))]
+        );
+    }
+
+    #[test]
+    fn diff_emits_delete_for_vanished_match() {
+        let old = vec![(dm(5, 7, &["a", "b"]), orow(100))];
+        let new: Vec<(SeqMatch, OwnedRow)> = vec![];
+        assert_eq!(diff_provisional(&old, &new), vec![(Op::Delete, orow(100))]);
+    }
+
+    #[test]
+    fn diff_emits_insert_for_brand_new_match() {
+        let old: Vec<(SeqMatch, OwnedRow)> = vec![];
+        let new = vec![(dm(5, 7, &["a", "b"]), orow(200))];
+        assert_eq!(diff_provisional(&old, &new), vec![(Op::Insert, orow(200))]);
+    }
+
+    #[test]
+    fn diff_unchanged_match_emits_nothing() {
+        let old = vec![(dm(5, 7, &["a", "b"]), orow(100))];
+        let new = vec![(dm(5, 7, &["a", "b"]), orow(100))];
+        assert_eq!(diff_provisional(&old, &new), vec![]);
+    }
+
+    /// Same extent and labels, but the evaluated output row changed — still a revision (the diff
+    /// compares the output row, not just the span/labels).
+    #[test]
+    fn diff_same_extent_different_row_is_revision() {
+        let old = vec![(dm(5, 7, &["a", "b"]), orow(100))];
+        let new = vec![(dm(5, 7, &["a", "b"]), orow(101))];
+        assert_eq!(
+            diff_provisional(&old, &new),
+            vec![(Op::Delete, orow(100)), (Op::Insert, orow(101))]
+        );
+    }
+
+    /// Regression: the inputs are NOT start-seq sorted. `provisional()` yields matches in the
+    /// matcher's scan (buffer-position) order, and seqs are minted at *arrival* — so a late row that
+    /// sorts earlier carries a higher seq at an earlier position, and position order diverges from
+    /// start_seq order. Here `old` holds (start 30, X) at the earlier position before (start 10, K);
+    /// `new` still holds the unchanged (start 10, K). A merge that trusted the input order would
+    /// emit Insert(K), Delete(X), Delete(K) — net-removing K downstream even though it is still
+    /// live. The internal sort must yield exactly Delete(X), keeping K present.
+    #[test]
+    fn diff_position_ordered_inputs_from_out_of_order_arrival() {
+        let old = vec![
+            (dm(30, 32, &["a", "b"]), orow(300)), // X: earlier position, later-minted seq
+            (dm(10, 12, &["a", "b"]), orow(100)), // K: later position, earlier-minted seq
+        ];
+        let new = vec![(dm(10, 12, &["a", "b"]), orow(100))];
+        assert_eq!(diff_provisional(&old, &new), vec![(Op::Delete, orow(300))]);
+
+        // Same provenance with both sides unsorted and K revised: the pairing must still be by
+        // identity, so X vanishes and K is retract-updated — never net-deleted.
+        let old = vec![
+            (dm(30, 32, &["a", "b"]), orow(300)),
+            (dm(10, 12, &["a", "b"]), orow(100)),
+        ];
+        let new = vec![
+            (dm(40, 42, &["a", "b"]), orow(400)),
+            (dm(10, 13, &["a", "b", "b"]), orow(101)),
+        ];
+        assert_eq!(
+            diff_provisional(&old, &new),
+            vec![
+                (Op::Delete, orow(100)),
+                (Op::Insert, orow(101)),
+                (Op::Delete, orow(300)),
+                (Op::Insert, orow(400)),
+            ]
+        );
+    }
+
+    /// Mixed sequence in one pass: start 1 unchanged, start 5 revised, start 9 vanished, start 11
+    /// brand new. Ops must come out start-seq ascending, Delete-before-Insert per revised identity.
+    #[test]
+    fn diff_mixed_sequence_orders_by_start_seq() {
+        let old = vec![
+            (dm(1, 3, &["a", "b"]), orow(10)),
+            (dm(5, 7, &["a", "b"]), orow(50)),
+            (dm(9, 10, &["a"]), orow(90)),
+        ];
+        let new = vec![
+            (dm(1, 3, &["a", "b"]), orow(10)),
+            (dm(5, 9, &["a", "b", "b"]), orow(59)),
+            (dm(11, 12, &["a"]), orow(110)),
+        ];
+        assert_eq!(
+            diff_provisional(&old, &new),
+            vec![
+                (Op::Delete, orow(50)),
+                (Op::Insert, orow(59)),
+                (Op::Delete, orow(90)),
+                (Op::Insert, orow(110)),
+            ]
+        );
+    }
 
     /// Oracle: feeding rows incrementally (in any split) must equal one batch
     /// `find_matches_dynamic` over the same rows.
