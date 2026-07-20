@@ -332,6 +332,22 @@ impl IncrementalMatcher {
         &self.matched
     }
 
+    /// Seqs of the rows fed so far, in feed (buffer-position) order — i.e. `seq_index`. The executor
+    /// reads this to align the matcher with the freshly-scanned state-table buffer each visit and to
+    /// detect an out-of-order safe row (one whose sorted position precedes an already-fed row).
+    pub fn fed_seqs(&self) -> &[i64] {
+        &self.seq_index
+    }
+
+    /// Number of leading buffer positions that are frozen (immutable under future appends) — i.e.
+    /// `next_pos`, the scan-resume point. [`IncrementalMatcher::finalize_before_seq`] may only evict a
+    /// prefix that lies within this frozen region, so the executor compares its eviction boundary
+    /// against this before finalizing (and drops-and-rebuilds the matcher when eviction reaches past
+    /// it). Distinct from [`IncrementalMatcher::frozen`], which counts frozen *matches*, not positions.
+    pub fn frozen_prefix_len(&self) -> usize {
+        self.next_pos
+    }
+
     /// Number of leading `provisional()` entries that are frozen (final under future appends).
     /// Test-only observability for asserting freezing behavior directly.
     #[cfg(test)]

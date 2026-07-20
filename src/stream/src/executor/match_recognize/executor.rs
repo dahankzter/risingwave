@@ -56,11 +56,15 @@
 //! State: the buffered rows (the raw input row plus its satisfied pattern variables) are persisted
 //! to a state table — written through on arrival, deleted on consumption — and restored on recovery.
 //!
-//! Matching is not incremental: each advancing watermark re-runs the matcher from the start of the
-//! buffer rather than resuming partial NFA state. Eviction and empty-partition removal keep the
-//! buffer bounded to the live (unfinalized) window, so the work per watermark is bounded by that
-//! window rather than the partition's history; carrying incremental NFA state across watermarks is a
-//! possible future optimization.
+//! Matching is driven by a per-partition [`IncrementalMatcher`] (kept in an in-memory `matchers`
+//! cache): each visit feeds the newly-safe rows and reads `provisional()`, which by construction
+//! equals a from-scratch `find_matches_dynamic` over the safe prefix (see the incremental module's
+//! differential oracle), so emission and eviction are byte-identical to the previous full-rescan
+//! path. The cache is a pure derivation of state-table content — dropped on recovery and on any
+//! vnode-bitmap change, and rebuilt lazily per partition by feeding its recovered buffer. It carries
+//! the live-window seqs + labels (never row data), the foundation an emit-on-update mode retracts
+//! against. Eviction and empty-partition removal keep the buffer bounded to the live (unfinalized)
+//! window, so the work per watermark is bounded by that window rather than the partition's history.
 
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -81,7 +85,8 @@ use risingwave_pb::stream_plan::{
 use risingwave_storage::StateStore;
 use risingwave_storage::store::PrefetchOptions;
 
-use super::nfa::{CandidateMatcher, Nfa, SkipDegradation, SkipMode};
+use super::incremental::IncrementalMatcher;
+use super::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipDegradation, SkipMode};
 use crate::common::table::state_table::StateTable;
 use crate::executor::prelude::*;
 use crate::task::ActorEvalErrorReport;
@@ -496,6 +501,44 @@ impl CandidateMatcher for DefineMatcher<'_> {
     }
 }
 
+/// Align a partition's [`IncrementalMatcher`] with the freshly-scanned safe prefix `rows[0..safe_len]`
+/// (PK-ordered, so the fed rows should be a leading run of it) before its `provisional()` is read.
+///
+/// The common case is a plain append: the safe rows already fed are a prefix of `rows`, so the tail
+/// `rows[fed_len..safe_len]` is fed via [`IncrementalMatcher::advance`]. If a safe row arrived
+/// out-of-order — its sorted position precedes an already-fed row, so the first divergence sits at a
+/// position `< fed.len()` — the matcher is rolled back with [`IncrementalMatcher::truncate_from_seq`]
+/// at the first displaced fed row's seq (the resync point), then the corrected sorted suffix from the
+/// divergence is re-fed. `matcher` is this visit's `DefineMatcher`; it resolves absolute positions
+/// into `rows`, so the matcher's positions stay aligned with the buffer.
+async fn refresh_matcher(
+    inc: &mut IncrementalMatcher,
+    rows: &[BufferedRow],
+    safe_len: usize,
+    matcher: &(impl CandidateMatcher + Sync),
+) -> StreamExecutorResult<()> {
+    // First position where the freshly-read safe buffer diverges from the already-fed seqs.
+    let (diverge_at, resync) = {
+        let fed = inc.fed_seqs();
+        let mut i = 0;
+        while i < safe_len && i < fed.len() && rows[i].seq == fed[i] {
+            i += 1;
+        }
+        // A divergence with fed rows still remaining means a safe row sorts before an already-fed
+        // one: `fed[i]` is the first fed row whose sorted position shifted (the resync seq).
+        let resync = (i < fed.len()).then(|| fed[i]);
+        (i, resync)
+    };
+    if let Some(resync) = resync {
+        inc.truncate_from_seq(resync, matcher).await?;
+    }
+    // Feed the (corrected) sorted suffix from the divergence point. Empty in the steady state where
+    // nothing new became safe; a no-op `advance` then.
+    let new_seqs: Vec<i64> = rows[diverge_at..safe_len].iter().map(|r| r.seq).collect();
+    inc.advance(&new_seqs, matcher).await?;
+    Ok(())
+}
+
 pub struct MatchRecognizeExecutorArgs<S: StateStore> {
     pub ctx: ActorContextRef,
     pub input: Executor,
@@ -769,6 +812,13 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
         // with nothing due skip the per-vnode index scans with a single comparison.
         let mut min_wakeup: Option<Datum> = None;
 
+        // Per-partition incremental matchers, keyed by partition key. A pure in-memory derivation of
+        // state-table content: created empty here (so it is empty after recovery — the state table is
+        // authoritative and each partition's matcher rebuilds lazily from its scanned buffer) and
+        // cleared on any vnode-bitmap change below (the rescale-desync precedent — a stale matcher for
+        // a re-homed partition must never survive). Each holds only the live window's seqs + labels.
+        let mut matchers: HashMap<OwnedRow, IncrementalMatcher> = HashMap::new();
+
         // No in-memory partition buffer: the state table is the single source of truth. Inserts are
         // written through immediately; each watermark scans the buffered rows back in PK order
         // (partition, order key, seq), processing one partition at a time and holding only that
@@ -978,13 +1028,15 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             }
 
                             if rows.is_empty() {
-                                // Stale frontier entry for an empty partition: drop it.
+                                // Stale frontier entry for an empty partition: drop it, and any
+                                // matcher (its buffer is gone, so its cache must not linger).
                                 Self::remove_frontier(
                                     &mut frontier_meta_table,
                                     &mut frontier_index_table,
                                     &partition_key,
                                     &old_wakeup,
                                 );
+                                matchers.remove(&partition_key);
                                 continue;
                             }
 
@@ -1015,7 +1067,35 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 defines: &defines,
                                 within: within.as_ref(),
                             };
-                            let found = nfa.find_matches_dynamic(safe_len, &matcher, &skip).await?;
+                            // Drive matching through this partition's incremental matcher instead of
+                            // rescanning the whole safe prefix. Feed the newly-safe rows (resyncing on
+                            // out-of-order arrival) and read `provisional()`, which by construction
+                            // equals `find_matches_dynamic(safe_len, &matcher, &skip)` — so every
+                            // downstream emit/evict decision below is unchanged.
+                            let inc = matchers
+                                .entry(partition_key.clone())
+                                .or_insert_with(|| IncrementalMatcher::new(&nfa, skip.clone()));
+                            refresh_matcher(inc, &rows, safe_len, &matcher).await?;
+                            // Map seq-anchored provisional matches back to buffer positions. A match
+                            // spans contiguous positions, so `end = start + labels.len()`, exactly as
+                            // `find_matches_dynamic` reports it.
+                            let mut seq_to_pos: HashMap<i64, usize> =
+                                HashMap::with_capacity(safe_len);
+                            for (p, r) in rows[..safe_len].iter().enumerate() {
+                                seq_to_pos.insert(r.seq, p);
+                            }
+                            let found: Vec<LabeledMatch> = inc
+                                .provisional()
+                                .iter()
+                                .map(|m| {
+                                    let start = seq_to_pos[&m.start_seq];
+                                    LabeledMatch {
+                                        start,
+                                        end: start + m.labels.len(),
+                                        labels: m.labels.clone(),
+                                    }
+                                })
+                                .collect();
                             let mut cursor = 0usize;
                             for m in found {
                                 if m.start < cursor {
@@ -1179,6 +1259,34 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                     .delete(once(Some(ScalarImpl::Int64(c.seq))).chain(&c.row));
                             }
 
+                            // Keep the matcher aligned with the post-eviction buffer. The evicted rows
+                            // are `rows[0..retain_from]`; the surviving front becomes `rows[retain_from]`.
+                            // `finalize_before_seq` rebases the matcher to that row, but only when the
+                            // evicted prefix lies within the frozen region (`retain_from <= frozen
+                            // prefix len`) and that row was actually fed (`retain_from < safe_len`).
+                            // Otherwise — the whole buffer drained, only unsafe (never-fed) rows
+                            // survive, or eviction reached past the frozen boundary (a trailing dead
+                            // gap, or a WITHIN-expired but structurally-live partial) — the matcher
+                            // cannot rebase there, so drop it and let the next visit rebuild lazily
+                            // from the scanned buffer. Both paths keep `provisional()` equal to a
+                            // from-scratch scan of the surviving buffer on the next visit.
+                            if retain_from > 0 {
+                                if retain_from < safe_len
+                                    && retain_from
+                                        <= matchers
+                                            .get(&partition_key)
+                                            .expect("matcher inserted above")
+                                            .frozen_prefix_len()
+                                {
+                                    matchers
+                                        .get_mut(&partition_key)
+                                        .expect("matcher inserted above")
+                                        .finalize_before_seq(rows[retain_from].seq);
+                                } else {
+                                    matchers.remove(&partition_key);
+                                }
+                            }
+
                             // Recompute the wakeup frontier as the earlier of two events:
                             //
                             //  (a) the next row to become safe — the earliest surviving row that is not
@@ -1303,6 +1411,10 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         // The owned-vnode set changed: the in-memory frontier lower bound no longer
                         // describes it. Unknown forces the next watermark to scan and re-establish.
                         min_wakeup = None;
+                        // Drop every cached matcher: a re-homed partition's matcher would be a stale
+                        // derivation of a buffer this actor no longer owns (the rescale-desync
+                        // precedent). Each surviving partition rebuilds lazily from its scanned buffer.
+                        matchers.clear();
                         if cache_may_stale {
                             row_id_gen = RowIdGenerator::new(
                                 state_table.vnodes().iter_vnodes(),
