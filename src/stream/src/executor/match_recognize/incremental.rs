@@ -34,6 +34,12 @@
 //! skipped, and the resume point — is final. Any live position (a still-open trailing match, or a
 //! gap where a longer, higher-preference alternative is still in flight) keeps the region
 //! provisional and re-attempted on the next advance.
+//!
+//! A late (out-of-order) row that sorts *before* rows already fed is handled by
+//! [`IncrementalMatcher::truncate_from_seq`]: it rolls state back to a scan-resume point at or before
+//! the insertion, re-verifying the freezing gate against the truncation boundary (freezing is only
+//! sound against the boundary it was checked at), after which the caller re-feeds the corrected
+//! sorted suffix through `advance`.
 
 use crate::executor::error::StreamExecutorResult;
 use crate::executor::match_recognize::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipMode};
@@ -181,6 +187,73 @@ impl IncrementalMatcher {
         Ok(())
     }
 
+    /// Invalidate everything at and after the fed row identified by `seq`, so the caller can re-feed
+    /// a corrected sorted suffix (an out-of-order row landing before rows already fed). `seq` is the
+    /// stable identity of the first buffered row whose sorted position changes; the executor computes
+    /// it (the first buffered order key `>=` the late row's), and here we only map it back to a fed
+    /// position via `seq_index`.
+    ///
+    /// A seq never fed (e.g. an order key beyond everything buffered) is a no-op; truncating at the
+    /// first fed row (position 0) is a full reset. After this call `provisional()` never returns a
+    /// match overlapping the truncated region.
+    ///
+    /// Why this needs the `matcher` (and so mirrors [`IncrementalMatcher::advance`]'s freezing gate
+    /// rather than a purely positional rule): a match froze against a *later* boundary, and freezing
+    /// only requires every region position to be dead at *that* boundary — a position may still hold
+    /// a path that stays alive *through* the rows now being truncated (a longer, higher-preference
+    /// alternative that only died past the truncation point). Such a frozen match is not final once
+    /// those rows change, even when its own span ends before the truncation point. So we recompute
+    /// the surviving frozen prefix with the exact gate `advance` uses — region-wide
+    /// [`Nfa::reaches_boundary_alive`] — but against the truncation boundary. Only a region entirely
+    /// dead at that boundary is independent of the truncated/re-fed rows and may be kept; the rest
+    /// (and every provisional match) is dropped and re-derived by the following `advance`, which
+    /// rescans from the rewound `next_pos`.
+    pub async fn truncate_from_seq(
+        &mut self,
+        seq: i64,
+        matcher: &(impl CandidateMatcher + Sync),
+    ) -> StreamExecutorResult<()> {
+        // Seqs are stable row identities, not sort keys, so `seq_index` is not ordered by value; find
+        // the exact entry. A missing seq means nothing buffered at/after it changed — leave state as
+        // is.
+        let Some(trunc_pos) = self.seq_index.iter().position(|&s| s == seq) else {
+            return Ok(());
+        };
+
+        let mut kept = 0usize;
+        let mut cursor = 0usize;
+        'keep: for m in &self.matched[..self.frozen_count] {
+            // Frozen matches are stored in scan order, so each start is at or after the cursor; search
+            // forward from there to recover its buffer position (seqs are not positions).
+            let start_pos = cursor
+                + self.seq_index[cursor..]
+                    .iter()
+                    .position(|&s| s == m.start_seq)
+                    .expect("frozen match start seq must still be fed at truncation");
+            let end_pos = start_pos + m.labels.len();
+            // A match reaching into (or across) the truncated region cannot survive: the re-fed rows
+            // may change its greedy extent or its skip-resume point.
+            if end_pos > trunc_pos {
+                break;
+            }
+            // `resume <= end_pos <= trunc_pos`, so every checked position is in the retained region.
+            let resume = self.skip.next_pos(start_pos, end_pos, &m.labels);
+            for p in cursor..resume {
+                if self.nfa.reaches_boundary_alive(p, trunc_pos, matcher).await? {
+                    break 'keep;
+                }
+            }
+            cursor = resume;
+            kept += 1;
+        }
+
+        self.next_pos = cursor;
+        self.frozen_count = kept;
+        self.matched.truncate(kept);
+        self.seq_index.truncate(trunc_pos);
+        Ok(())
+    }
+
     /// Current provisional matches over everything fed so far, as if input ended now.
     pub fn provisional(&self) -> &[SeqMatch] {
         &self.matched
@@ -260,6 +333,36 @@ mod tests {
 
     fn quant(inner: Pattern, q: Quantifier, reluctant: bool) -> Pattern {
         Pattern::Quantified(Box::new(inner), q, reluctant)
+    }
+
+    fn labels(ls: &[&str]) -> Vec<String> {
+        ls.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Provisional matches as `(start_pos, end_pos, labels)`. In the truncation tests seqs are
+    /// assigned equal to final sorted position, so a seq is directly its position and these triples
+    /// line up with the batch oracle's position-anchored spans.
+    fn provisional_triples(inc: &IncrementalMatcher) -> Vec<(usize, usize, Vec<String>)> {
+        inc.provisional()
+            .iter()
+            .map(|m| (m.start_seq as usize, m.end_seq as usize, m.labels.clone()))
+            .collect()
+    }
+
+    /// Batch oracle over `rows` as `(start, end, labels)` triples (labels included so a *steal* —
+    /// a row rebinding to a different variable — is caught, not just span changes).
+    async fn batch_triples(
+        nfa: &Nfa,
+        skip: &SkipMode,
+        rows: &[BTreeSet<String>],
+    ) -> Vec<(usize, usize, Vec<String>)> {
+        let matcher = SetMatcher::new(rows.to_vec());
+        nfa.find_matches_dynamic(rows.len(), &matcher, skip)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| (m.start, m.end, m.labels.clone()))
+            .collect()
     }
 
     #[tokio::test]
@@ -494,5 +597,250 @@ mod tests {
             );
             assert_eq!(inc.frozen(), 0);
         }
+    }
+
+    /// Step 1 out-of-order reinsert with a *steal*. Rows arrive `[r0, r1, r3, r4]`; a late `r2`
+    /// lands between `r1` and `r3`. Pattern `a+ b` over the pre-insert rows `[{a}, {a,b}, {x}, {x}]`
+    /// freezes the match `a b` = `(0,2)` with `r1` bound as the closing `b`. The late `r2 = {b}`
+    /// inserted at position 2 lets the greedy `a+` swallow `r1` as an extra `a` and bind `r2` as the
+    /// `b`, so the batch answer over `[{a}, {a,b}, {b}, {x}, {x}]` is the longer `(0,3)` = `a a b`
+    /// (r1 stolen from `b` to `a`). Truncating at `r3`'s seq must invalidate the frozen `(0,2)` — its
+    /// end reaches the truncation point — and rewind so the re-feed re-derives `(0,3)`.
+    #[tokio::test]
+    async fn out_of_order_reinsert_equals_batch() {
+        let pat = Pattern::Concat(vec![
+            quant(Pattern::Var("a".into()), Quantifier::Plus, false),
+            Pattern::Var("b".into()),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        // Buffer before the late arrival (sorted positions 0..4).
+        let pre_rows = vec![sets(&["a"]), sets(&["a", "b"]), sets(&["x"]), sets(&["x"])];
+        let pre_matcher = SetMatcher::new(pre_rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3], &pre_matcher).await.unwrap();
+        // `a b` = (0,2) freezes with r1 bound `b`.
+        assert_eq!(provisional_triples(&inc), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(inc.frozen(), 1);
+
+        // r2 = {b} sorts between r1 (pos 1) and r3 (pos 2). r3 is the first buffered row whose sorted
+        // position changes, so the caller truncates at r3's seq (2).
+        inc.truncate_from_seq(2, &pre_matcher).await.unwrap();
+        // The frozen match reached the truncation point, so nothing survives.
+        assert_eq!(provisional_triples(&inc), vec![]);
+        assert_eq!(inc.frozen(), 0);
+
+        // Re-feed the sorted suffix [r2, r3, r4] with their final positions as seqs.
+        let final_rows = vec![
+            sets(&["a"]),
+            sets(&["a", "b"]),
+            sets(&["b"]),
+            sets(&["x"]),
+            sets(&["x"]),
+        ];
+        let final_matcher = SetMatcher::new(final_rows.clone());
+        inc.advance(&[2, 3, 4], &final_matcher).await.unwrap();
+
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &final_rows).await
+        );
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 3, labels(&["a", "a", "b"]))]
+        );
+    }
+
+    /// Truncation landing in the *middle* of the frozen region: an earlier frozen match survives
+    /// while a later one is dropped, so `next_pos` rewinds to the survivor's resume point (not 0).
+    /// Pattern `a b` over `[{a},{b},{x},{a},{b},{x}]` freezes both `(0,2)` and `(3,5)`. A late `{a}`
+    /// sorts at position 3 (before the second match): truncating at that row's seq keeps `(0,2)` and
+    /// invalidates `(3,5)`, and the re-feed re-derives the shifted second match `(4,6)`.
+    #[tokio::test]
+    async fn truncate_inside_frozen_region_keeps_earlier_matches() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        let pre_rows = vec![
+            sets(&["a"]),
+            sets(&["b"]),
+            sets(&["x"]),
+            sets(&["a"]),
+            sets(&["b"]),
+            sets(&["x"]),
+        ];
+        let pre_matcher = SetMatcher::new(pre_rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3, 4, 5], &pre_matcher).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (3, 5, labels(&["a", "b"]))]
+        );
+        assert_eq!(inc.frozen(), 2);
+
+        // A late {a} sorts at position 3; the old row at position 3 is the first whose sorted position
+        // changes, so the caller truncates at its seq (3).
+        inc.truncate_from_seq(3, &pre_matcher).await.unwrap();
+        // (0,2) survives (its region is dead at boundary 3); (3,5) reaches past it and is dropped.
+        assert_eq!(provisional_triples(&inc), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(inc.frozen(), 1);
+
+        // Re-feed the sorted suffix [late {a}, old rows] from position 3, with final positions as seqs.
+        let final_rows = vec![
+            sets(&["a"]),
+            sets(&["b"]),
+            sets(&["x"]),
+            sets(&["a"]),
+            sets(&["a"]),
+            sets(&["b"]),
+            sets(&["x"]),
+        ];
+        let final_matcher = SetMatcher::new(final_rows.clone());
+        inc.advance(&[3, 4, 5, 6], &final_matcher).await.unwrap();
+
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &final_rows).await
+        );
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (4, 6, labels(&["a", "b"]))]
+        );
+    }
+
+    /// Truncating at the first fed row is a full reset. A late `{a}` sorting before everything shifts
+    /// all positions, so the caller truncates at seq 0; state must clear entirely, and re-feeding the
+    /// whole corrected sequence must equal the batch answer.
+    #[tokio::test]
+    async fn truncate_to_zero_resets_and_refeeds() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        let pre_rows = vec![sets(&["a"]), sets(&["b"]), sets(&["x"])];
+        let pre_matcher = SetMatcher::new(pre_rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2], &pre_matcher).await.unwrap();
+        assert_eq!(provisional_triples(&inc), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(inc.frozen(), 1);
+
+        // A late {a} sorts before r0, so r0 (seq 0) is the first row whose position changes.
+        inc.truncate_from_seq(0, &pre_matcher).await.unwrap();
+        assert_eq!(provisional_triples(&inc), vec![]);
+        assert_eq!(inc.frozen(), 0);
+
+        let final_rows = vec![sets(&["a"]), sets(&["a"]), sets(&["b"]), sets(&["x"])];
+        let final_matcher = SetMatcher::new(final_rows.clone());
+        inc.advance(&[0, 1, 2, 3], &final_matcher).await.unwrap();
+
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &final_rows).await
+        );
+        assert_eq!(provisional_triples(&inc), vec![(1, 3, labels(&["a", "b"]))]);
+    }
+
+    /// THE case a positional (matcher-free) truncation rule gets wrong — do not simplify
+    /// `truncate_from_seq` back to "drop frozen matches whose end position >= trunc_pos".
+    ///
+    /// Pattern `(a b c d) | (a b)` (long branch preferred) over `[{a},{b},{c},{x}]`: the short
+    /// branch matches `(0,2)`, and it freezes only once the `x` at position 3 kills the long branch
+    /// (at boundary 3 the long branch is still alive — `a b c` reaches the boundary inside the
+    /// automaton — so no freeze happens there). A late `{d}` then sorts at position 3, displacing
+    /// the `x`. Truncating at the x-row's seq re-checks the frozen region against boundary 3, where
+    /// position 0 is alive again, so `(0,2)` must be dropped even though its end (2) lies strictly
+    /// before the truncation position (3); the re-feed then derives the long match `(0,4)`. The
+    /// positional rule keeps `(0,2)` and rewinds to its resume point 2 — no match can start at
+    /// `{c}`/`{d}`/`{x}`, so it would wrongly answer `(0,2)` forever.
+    #[tokio::test]
+    async fn truncation_recheck_drops_frozen_match_alive_at_new_boundary() {
+        let pat = Pattern::Alt(vec![
+            Pattern::Concat(vec![
+                Pattern::Var("a".into()),
+                Pattern::Var("b".into()),
+                Pattern::Var("c".into()),
+                Pattern::Var("d".into()),
+            ]),
+            Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("b".into())]),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        let pre_rows = vec![sets(&["a"]), sets(&["b"]), sets(&["c"]), sets(&["x"])];
+        let pre_matcher = SetMatcher::new(pre_rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3], &pre_matcher).await.unwrap();
+        // The `x` kills the long branch at position 3, so the short `(0,2)` freezes.
+        assert_eq!(provisional_triples(&inc), vec![(0, 2, labels(&["a", "b"]))]);
+        assert_eq!(inc.frozen(), 1);
+
+        // The late {d} sorts at position 3; the old {x} row (seq 3) is the first buffered row whose
+        // sorted position changes, so the caller truncates at its seq.
+        inc.truncate_from_seq(3, &pre_matcher).await.unwrap();
+        // Discriminator: the frozen (0,2) ends *before* the truncation position, yet position 0 is
+        // alive at the new boundary — the liveness re-check must drop it. The positional rule keeps
+        // it here, and these two assertions (and the batch check below) fail under that rule.
+        assert_eq!(provisional_triples(&inc), vec![]);
+        assert_eq!(inc.frozen(), 0);
+
+        // Re-feed the sorted suffix [late {d}, old {x}] with final positions as seqs.
+        let final_rows = vec![
+            sets(&["a"]),
+            sets(&["b"]),
+            sets(&["c"]),
+            sets(&["d"]),
+            sets(&["x"]),
+        ];
+        let final_matcher = SetMatcher::new(final_rows.clone());
+        inc.advance(&[3, 4], &final_matcher).await.unwrap();
+
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &final_rows).await
+        );
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 4, labels(&["a", "b", "c", "d"]))]
+        );
+    }
+
+    /// Truncating at a seq that was never fed is a no-op: neither a seq past everything buffered nor
+    /// one exactly one-past-the-end may touch state, and later appends must still equal the batch.
+    #[tokio::test]
+    async fn truncate_unknown_seq_is_noop() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        let rows = from_str("abbc");
+        let matcher = SetMatcher::new(rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2], &matcher).await.unwrap();
+        let before = inc.provisional().to_vec();
+        let before_frozen = inc.frozen();
+
+        // A seq far past everything buffered, and the seq exactly one past the last fed row: both are
+        // absent from `seq_index`, so both leave state untouched.
+        inc.truncate_from_seq(99, &matcher).await.unwrap();
+        inc.truncate_from_seq(3, &matcher).await.unwrap();
+        assert_eq!(inc.provisional(), before.as_slice());
+        assert_eq!(inc.frozen(), before_frozen);
+
+        // Appending really does append (nothing corrupted): the final answer equals the batch.
+        inc.advance(&[3], &matcher).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &rows).await
+        );
     }
 }
