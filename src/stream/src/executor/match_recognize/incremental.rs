@@ -26,9 +26,14 @@
 //! Matches are anchored by row *seq* rather than buffer *position* so they stay stable when earlier
 //! rows are evicted (a later task); positions are an internal detail of the current buffer.
 //!
-//! v1 freezing rule (see [`IncrementalMatcher::advance`]): a match is frozen once its `end` lies
-//! strictly before the buffer boundary; a match ending *at* the boundary is still open and is
-//! re-attempted on the next advance, since an appended row may extend it.
+//! Freezing rule (see [`IncrementalMatcher::advance`]): a match — and the scan region behind it up
+//! to its skip-resume position — freezes only once *every* position in that region is dead at the
+//! current boundary per [`Nfa::reaches_boundary_alive`] (the same liveness predicate row eviction
+//! uses). A dead position's scan outcome can never change under appended rows, because no path from
+//! it can consume past the old boundary; so the whole region's scan behavior — matches found, gaps
+//! skipped, and the resume point — is final. Any live position (a still-open trailing match, or a
+//! gap where a longer, higher-preference alternative is still in flight) keeps the region
+//! provisional and re-attempted on the next advance.
 
 use crate::executor::error::StreamExecutorResult;
 use crate::executor::match_recognize::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipMode};
@@ -106,9 +111,13 @@ impl IncrementalMatcher {
     ///
     /// Rescans only the mutable suffix `[next_pos, n_rows)` via [`Nfa::find_matches_dynamic`] (through
     /// an [`OffsetMatcher`]), replacing the provisional tail of `matched`. It then freezes the leading
-    /// suffix matches whose `end` is strictly before the new boundary `n_rows` and advances `next_pos`
-    /// to the last frozen match's skip-resume position; a match ending at the boundary stays open and
-    /// will be re-attempted next time, since an appended row may extend it.
+    /// run of suffix matches whose entire scan region `[cursor, skip-resume)` is dead at the boundary
+    /// per [`Nfa::reaches_boundary_alive`], advancing `next_pos` to the last frozen match's resume
+    /// position. Checking the *whole region* — not just the match's start — matters: a gap position
+    /// before the match can be alive (a longer, higher-preference alternative still in flight) and a
+    /// future row could then produce a match there that consumes past this one, so nothing behind
+    /// that gap may freeze. Liveness is checked with the raw `matcher` at absolute positions (only
+    /// the finder needs the offset adapter, because it always scans from 0).
     pub async fn advance(
         &mut self,
         new_row_seqs: &[i64],
@@ -142,13 +151,26 @@ impl IncrementalMatcher {
             })
             .collect();
 
-        // Freeze the leading run of matches that end strictly before the boundary; stop at the first
-        // match ending at the boundary (still open — an appended row may extend it).
-        let newly_frozen = tail_abs.iter().take_while(|m| m.end < n_rows).count();
-        if newly_frozen > 0 {
-            let last = &tail_abs[newly_frozen - 1];
-            self.next_pos = self.skip.next_pos(last.start, last.end, &last.labels);
+        // Freeze the leading run of matches whose scan region `[cursor, resume)` is entirely dead at
+        // the boundary. A dead position's scan outcome is final — no path from it can consume past
+        // `n_rows - 1`, so appended rows can never be reached from it and the greedy attempt there
+        // returns the same result over any future buffer. Matches freeze strictly in order (there is
+        // a single cursor), so stop at the first region containing a live position. A match ending
+        // at the boundary is covered without a special case: its own accepting path reaches the
+        // boundary, so its start is alive and the region check fails.
+        let mut newly_frozen = 0usize;
+        let mut cursor = self.next_pos;
+        'freeze: for m in &tail_abs {
+            let resume = self.skip.next_pos(m.start, m.end, &m.labels);
+            for p in cursor..resume {
+                if self.nfa.reaches_boundary_alive(p, n_rows, matcher).await? {
+                    break 'freeze;
+                }
+            }
+            cursor = resume;
+            newly_frozen += 1;
         }
+        self.next_pos = cursor;
 
         // Drop the previous provisional tail and reattach the freshly scanned suffix.
         let new_tail: Vec<SeqMatch> = tail_abs.iter().map(|m| self.to_seq_match(m)).collect();
@@ -162,6 +184,13 @@ impl IncrementalMatcher {
     /// Current provisional matches over everything fed so far, as if input ended now.
     pub fn provisional(&self) -> &[SeqMatch] {
         &self.matched
+    }
+
+    /// Number of leading `provisional()` entries that are frozen (final under future appends).
+    /// Test-only observability for asserting freezing behavior directly.
+    #[cfg(test)]
+    fn frozen(&self) -> usize {
+        self.frozen_count
     }
 
     /// Convert an absolute-position [`LabeledMatch`] into a seq-anchored [`SeqMatch`]. A match always
@@ -179,7 +208,7 @@ impl IncrementalMatcher {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::executor::match_recognize::incremental::IncrementalMatcher;
+    use super::{IncrementalMatcher, SeqMatch};
     use crate::executor::match_recognize::nfa::{Nfa, Pattern, Quantifier, SetMatcher, SkipMode};
 
     /// Oracle: feeding rows incrementally (in any split) must equal one batch
@@ -383,21 +412,13 @@ mod tests {
         .await;
     }
 
-    /// Known v1 limitation, kept as an executable spec for a later task (do not delete). The v1
-    /// freezing rule — "a match is frozen once its `end` is strictly before the buffer boundary" —
-    /// is unsound for an alternation whose *shorter* alternative accepts strictly before the
-    /// boundary while a *longer*, higher-preference alternative is still alive *at* the boundary.
-    ///
-    /// Here `(a b c) | a` over `[a, b]` returns the fallback `a` match `(0,1)` (the `a b c` branch
-    /// is alive but not yet accepting at the boundary). `end = 1 < 2`, so v1 freezes `(0,1)`. When
-    /// `c` is then appended, the batch answer is `(0,3)` ("abc") — so the frozen incremental result
-    /// diverges. The sound fix (deferred to a later task) gates freezing on
-    /// [`crate::executor::match_recognize::nfa::Nfa::reaches_boundary_alive`], the same liveness
-    /// predicate eviction already uses; it is intentionally *not* applied here to keep v1's freezing
-    /// rule exactly as specified.
-    #[ignore = "documents a known v1 freezing-rule soundness gap; addressed in a later task"]
+    /// The freezing gate must consult boundary liveness, not just "match ended before the boundary".
+    /// `(a b c) | a` over `[a, b]` returns the fallback `a` match `(0,1)` while the longer,
+    /// higher-preference `a b c` branch is still alive *at* the boundary (waiting for `c`). The
+    /// naive `end < n_rows` rule would freeze `(0,1)`; the liveness gate sees position 0 alive and
+    /// defers, so when `c` arrives the rescan finds the batch answer `(0,3)` ("abc").
     #[tokio::test]
-    async fn known_limitation_alternation_alive_at_boundary_diverges() {
+    async fn alternation_alive_at_boundary_defers_freezing() {
         let pat = Pattern::Alt(vec![
             Pattern::Concat(vec![
                 Pattern::Var("a".into()),
@@ -409,5 +430,69 @@ mod tests {
         let nfa = Nfa::compile(&pat);
         let rows = from_str("abc");
         assert_equiv(&nfa, SkipMode::PastLastRow, &rows, &[2]).await;
+        assert_equiv(&nfa, SkipMode::PastLastRow, &rows, &[1, 2]).await;
+    }
+
+    /// A *gap* position (no match there yet) can be the live one: `(a n n n) | n` over `[a, n, n]`
+    /// finds only `n` matches, but position 0's `a n n n` branch is alive at the boundary — one more
+    /// `n` turns the batch answer into the single match `(0,4)`. Freezing the early `n` matches
+    /// (whose own starts are dead) would lose it, so the gate must check every position in the
+    /// would-be-frozen region, not just match starts.
+    #[tokio::test]
+    async fn live_gap_position_defers_freezing() {
+        let pat = Pattern::Alt(vec![
+            Pattern::Concat(vec![
+                Pattern::Var("a".into()),
+                Pattern::Var("n".into()),
+                Pattern::Var("n".into()),
+                Pattern::Var("n".into()),
+            ]),
+            Pattern::Var("n".into()),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let rows = from_str("annn");
+        assert_equiv(&nfa, SkipMode::PastLastRow, &rows, &[3]).await;
+        assert_equiv(&nfa, SkipMode::PastLastRow, &rows, &[1, 2, 3]).await;
+    }
+
+    /// A greedy trailing quantifier keeps the last match alive at the buffer end forever: `(a b+)`
+    /// fed one row at a time never freezes its trailing match, and the match keeps extending as
+    /// each `b` arrives.
+    #[tokio::test]
+    async fn trailing_quantified_match_extends_without_freezing() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let rows = from_str("abbb");
+        let matcher = SetMatcher::new(rows.clone());
+        let mut inc = IncrementalMatcher::new(&nfa, SkipMode::PastLastRow);
+
+        // [a]: `a` alone doesn't satisfy `a b+`, but it is alive (a `b` may arrive) — no match yet,
+        // nothing frozen.
+        inc.advance(&[0], &matcher).await.unwrap();
+        assert_eq!(inc.provisional(), &[]);
+        assert_eq!(inc.frozen(), 0);
+
+        // Each appended `b` extends the same match by one row; it always ends at the buffer end, so
+        // it stays alive and never freezes.
+        for (seq, expected_end) in [(1i64, 2i64), (2, 3), (3, 4)] {
+            inc.advance(&[seq], &matcher).await.unwrap();
+            assert_eq!(
+                inc.provisional(),
+                &[SeqMatch {
+                    start_seq: 0,
+                    end_seq: expected_end,
+                    labels: std::iter::once("a".to_string())
+                        .chain(std::iter::repeat_n(
+                            "b".to_string(),
+                            expected_end as usize - 1
+                        ))
+                        .collect(),
+                }]
+            );
+            assert_eq!(inc.frozen(), 0);
+        }
     }
 }
