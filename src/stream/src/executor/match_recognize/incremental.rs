@@ -74,6 +74,7 @@ pub struct SeqMatch {
 /// evicted prefix in place (staying reusable) or the eviction shape forces the caller to drop and
 /// rebuild it.
 #[derive(Debug)]
+#[must_use = "a dropped MustRebuild leaves a silently stale matcher — match on the result"]
 pub enum Finalized {
     /// The evicted prefix was finalized and the matcher rebased onto the surviving buffer; keep it.
     /// The finalized matches themselves are not carried: the executor prunes its diff base by

@@ -275,7 +275,9 @@
       pattern (a b)
       define a as a.v > 0, b as b.v < 0
     );
-  stream_error: 'emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the provisional-match state is unbounded. Add WITHIN, or declare EMIT ON WINDOW CLOSE'
+  stream_error: |-
+    Not supported: emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the provisional-match state is unbounded
+    HINT: add a WITHIN clause, or declare EMIT ON WINDOW CLOSE
 - name: MATCH_RECOGNIZE rejects a range quantifier whose lower bound exceeds its upper bound (silently became {5})
   sql: |
     create table t(id int, ts int, v int, watermark for ts as ts - 10) append only;

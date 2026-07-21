@@ -213,13 +213,17 @@ impl ToStream for LogicalMatchRecognize {
         // bounds a match's lifetime, so both grow without limit as PARTITION BY key cardinality grows
         // — unbounded *process* memory, not just persisted state. (Under EMIT ON WINDOW CLOSE only the
         // persisted buffer grows and there is no `last_emitted`, so a bind-time NOTICE suffices there;
-        // see the binder.) Reject at plan time rather than let the actor OOM at runtime. This mirrors
-        // the other `to_stream` gates below: a permanent restriction of the streaming operator, not a
-        // not-yet-implemented feature.
+        // see the binder.) Reject at plan time rather than let the actor OOM at runtime, as
+        // `NotSupported` with an actionable hint — a permanent restriction of the streaming operator,
+        // not a not-yet-implemented feature.
         if emit_on_update && self.core.within.is_none() {
-            bail!(
-                "emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the provisional-match state is unbounded. Add WITHIN, or declare EMIT ON WINDOW CLOSE"
-            );
+            return Err(crate::error::ErrorCode::NotSupported(
+                "emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the \
+                 provisional-match state is unbounded"
+                    .to_owned(),
+                "add a WITHIN clause, or declare EMIT ON WINDOW CLOSE".to_owned(),
+            )
+            .into());
         }
 
         // v1 restrictions: PARTITION BY / ORDER BY must be plain columns, PARTITION BY non-empty.

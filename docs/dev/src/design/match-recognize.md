@@ -431,11 +431,22 @@ match. What bounds that window depends on whether the pattern carries a `WITHIN`
   of distinct `PARTITION BY` keys, not by time. For an unbounded key space (per-session, per-device,
   …) it grows without limit.
 
-Resident memory is bounded either way — the executor streams partitions from the state table and
-holds nothing between watermarks — so the unbounded quantity is the *persisted* state on the storage
-engine, not process memory. To bound it, add a `WITHIN` clause; the binder emits a `NOTICE` when a
-`MATCH_RECOGNIZE` has none, as a reminder. An opt-in state TTL (dropping partials older than a
-configurable age, trading completeness for a hard bound) is possible future work.
+What that growth costs differs by emit mode:
+
+- Under **`EMIT ON WINDOW CLOSE`** resident memory is bounded regardless — the executor streams
+  partitions from the state table and holds nothing between watermarks — so the unbounded quantity
+  without `WITHIN` is only the *persisted* state on the storage engine, not process memory. The
+  binder emits a `NOTICE` when such a query has no `WITHIN`, as a reminder.
+- Under **emit-on-update** the operator additionally keeps two in-memory derivations of the buffer
+  across barriers: the changelog diff base (`last_emitted`) and the per-partition matcher cache. A
+  `WITHIN` bound is what expires a match and lets its rows evict, draining those structures; without
+  it they grow with `PARTITION BY` key cardinality — unbounded *process* memory. Emit-on-update
+  therefore **requires a `WITHIN` clause at plan time** (a `NotSupported` error otherwise, with the
+  hint to add `WITHIN` or declare `EMIT ON WINDOW CLOSE`), rather than warn at bind time and OOM at
+  runtime.
+
+An opt-in state TTL (dropping partials older than a configurable age, trading completeness for a
+hard bound) is possible future work.
 
 ## Limitations and future work
 
@@ -443,7 +454,9 @@ configurable age, trading completeness for a hard bound) is possible future work
 - The incremental matcher's cross-visit CPU saving is realized only in emit-on-update mode; under
   `EMIT ON WINDOW CLOSE`, eviction trims the frozen prefix each watermark, so it saves nothing there
   (see [The executor](#the-executor)).
-- Without a `WITHIN` clause, unmatched partials are retained indefinitely, so persisted state is
-  bounded only by `PARTITION BY` key cardinality (see [State bound and `WITHIN`](#state-bound-and-within));
-  the binder emits a `NOTICE` in that case.
+- Without a `WITHIN` clause, unmatched partials are retained indefinitely, so state is bounded only
+  by `PARTITION BY` key cardinality (see [State bound and `WITHIN`](#state-bound-and-within)).
+  Emit-on-update rejects that shape at plan time (the in-memory diff base and matcher cache would be
+  unbounded); `EMIT ON WINDOW CLOSE` allows it with a binder `NOTICE`, since only persisted state
+  grows there.
 - Anchors (`^`, `$`) and pattern exclusions (`{- … -}`) are parsed but rejected at planning time.

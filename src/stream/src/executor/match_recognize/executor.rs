@@ -768,15 +768,15 @@ async fn emit_partition_diff(
 /// watermark/barrier scans), and is complete by construction: a partition has rows iff the scan
 /// sees them.
 ///
-/// The wakeup-frontier index is NOT a valid enumerator here, even though the watermark arm drives
-/// its visits from it: the frontier drops a partition's entry whenever it has no future wakeup
-/// (`remove_frontier` on `new_wakeup == None` in the watermark arm), which is reachable with rows
-/// still buffered — all rows watermark-safe (`safe_len == rows.len()`) yet retained as live match
-/// starts (a boundary-complete match is held alive by the boundary-before-accept check), with no
-/// `WITHIN` deadline to schedule. The default no-`WITHIN` query shape hits this for every idle
-/// partition holding a boundary-complete match; enumerating from the frontier would skip exactly
-/// those partitions, leave their diff base empty, and duplicate-Insert their already-emitted
-/// matches at the next barrier.
+/// Enumerating from the buffer table itself — not the wakeup-frontier index — is deliberate: the
+/// buffer is the authoritative record of which partitions hold rows (complete by construction,
+/// above), while the frontier index is only a wakeup *schedule*. "Every buffered partition has a
+/// frontier entry" is a separate invariant this rebuild does not depend on — it currently holds
+/// (emit-on-update requires `WITHIN` at plan time, and a surviving safe row always schedules a
+/// within-deadline wakeup), but historically the no-`WITHIN` shape kept buffered rows with no
+/// frontier entry, and a frontier-driven rebuild would have skipped exactly those partitions and
+/// duplicate-Inserted their already-emitted matches at the next barrier. The buffer scan stays the
+/// correct-by-construction enumerator regardless of that invariant.
 #[expect(clippy::too_many_arguments)]
 async fn rebuild_last_emitted<S: StateStore>(
     state_table: &StateTable<S>,
@@ -1244,10 +1244,13 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         // State-table row layout: `[ seq, <input cols..> ]` — the partition columns
                         // and order key are columns of the stored input row. Written through by
                         // reference: `insert` takes `impl Row`, so the seq datum is chained onto the
-                        // borrowed chunk row with no intermediate owned materialization.
-                        state_table.insert(
-                            once(Some(ScalarImpl::Int64(row_id_gen.next()))).chain(row_ref),
-                        );
+                        // borrowed chunk row with no intermediate owned materialization. The minted
+                        // id passes through `Seq` and is unwrapped (`.0`) at the datum, mirroring the
+                        // `Seq(..)` wrap at every read — the storage boundary is grep-auditable in
+                        // both directions.
+                        let seq = Seq(row_id_gen.next());
+                        state_table
+                            .insert(once(Some(ScalarImpl::Int64(seq.0))).chain(row_ref));
                     }
                     // One frontier update per distinct partition. On insert `next_wakeup` only ever
                     // moves earlier (a new row can only make a partition need attention sooner); the
@@ -1667,7 +1670,9 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                         p,
                                     )
                                     .await;
-                                    // Window closed (deadline < w): `p` is dead, skip it.
+                                    // Window closed (deadline < w): `p` is dead, skip it. A null
+                                    // deadline (eval-error only) fails this test, so the position is
+                                    // conservatively retained — degenerate, deliberate.
                                     if matches!(&deadline, Some(d) if d.default_cmp(&w).is_lt()) {
                                         continue;
                                     }
