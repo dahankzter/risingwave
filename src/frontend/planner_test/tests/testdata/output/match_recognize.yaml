@@ -245,7 +245,25 @@
   binder_error: |-
     Feature is not yet implemented: ALL ROWS PER MATCH
     No tracking issue yet. Feel free to submit a feature request at https://github.com/risingwavelabs/risingwave/issues/new?labels=type%2Ffeature&template=feature_request.yml
-- name: MATCH_RECOGNIZE plain form plans as emit-on-update
+- name: MATCH_RECOGNIZE plain form with WITHIN plans as emit-on-update
+  sql: |
+    create table t(id int, ts int, v int, watermark for ts as ts - 10) append only;
+    select * from t match_recognize (
+      partition by id
+      order by ts
+      measures b.v as dip
+      one row per match
+      after match skip past last row
+      pattern (a b) within 3
+      define a as a.v > 0, b as b.v < 0
+    );
+  stream_plan: |-
+    StreamMaterialize { columns: [partition_0, dip, _match_id(hidden)], stream_key: [partition_0, _match_id], pk_columns: [partition_0, _match_id], pk_conflict: NoCheck }
+    └─StreamProject { exprs: [partition_0, dip, _match_id] }
+      └─StreamMatchRecognize { partition_by: [$0], order_by: [$1], measures: ["dip"], pattern: a b }
+        └─StreamExchange { dist: HashShard(t.id) }
+          └─StreamTableScan { table: t, columns: [t.id, t.ts, t.v, t._row_id], stream_scan_type: SnapshotBackfill, stream_key: [t._row_id], pk: [_row_id], dist: UpstreamHashShard(t._row_id) }
+- name: MATCH_RECOGNIZE plain form without WITHIN is rejected (emit-on-update needs a bounded window)
   sql: |
     create table t(id int, ts int, v int, watermark for ts as ts - 10) append only;
     select * from t match_recognize (
@@ -257,12 +275,7 @@
       pattern (a b)
       define a as a.v > 0, b as b.v < 0
     );
-  stream_plan: |-
-    StreamMaterialize { columns: [partition_0, dip, _match_id(hidden)], stream_key: [partition_0, _match_id], pk_columns: [partition_0, _match_id], pk_conflict: NoCheck }
-    └─StreamProject { exprs: [partition_0, dip, _match_id] }
-      └─StreamMatchRecognize { partition_by: [$0], order_by: [$1], measures: ["dip"], pattern: a b }
-        └─StreamExchange { dist: HashShard(t.id) }
-          └─StreamTableScan { table: t, columns: [t.id, t.ts, t.v, t._row_id], stream_scan_type: SnapshotBackfill, stream_key: [t._row_id], pk: [_row_id], dist: UpstreamHashShard(t._row_id) }
+  stream_error: 'emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the provisional-match state is unbounded. Add WITHIN, or declare EMIT ON WINDOW CLOSE'
 - name: MATCH_RECOGNIZE rejects a range quantifier whose lower bound exceeds its upper bound (silently became {5})
   sql: |
     create table t(id int, ts int, v int, watermark for ts as ts - 10) append only;

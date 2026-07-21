@@ -131,6 +131,7 @@ select * from t_eou_cascade match_recognize (
   one row per match
   after match skip to next row
   pattern (a a)
+  within 100
   define a as a.v > 0
 );
 
@@ -241,6 +242,7 @@ select * from t_eou_straddle match_recognize (
   one row per match
   after match skip to next row
   pattern (a a)
+  within 100
   define a as a.v > 0
 );
 

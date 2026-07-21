@@ -207,6 +207,21 @@ impl ToStream for LogicalMatchRecognize {
         // earlier rows with retractions as later input or the watermark revise the match.
         let emit_on_update = !ctx.emit_on_window_close();
 
+        // Emit-On-Update requires a WITHIN clause. In this mode the operator keeps an in-memory diff
+        // base (`last_emitted`) and a per-partition matcher cache; a WITHIN bound is what expires a
+        // match and lets its rows evict, draining those in-memory structures. Without WITHIN nothing
+        // bounds a match's lifetime, so both grow without limit as PARTITION BY key cardinality grows
+        // — unbounded *process* memory, not just persisted state. (Under EMIT ON WINDOW CLOSE only the
+        // persisted buffer grows and there is no `last_emitted`, so a bind-time NOTICE suffices there;
+        // see the binder.) Reject at plan time rather than let the actor OOM at runtime. This mirrors
+        // the other `to_stream` gates below: a permanent restriction of the streaming operator, not a
+        // not-yet-implemented feature.
+        if emit_on_update && self.core.within.is_none() {
+            bail!(
+                "emit-on-update MATCH_RECOGNIZE requires a WITHIN clause: without it the provisional-match state is unbounded. Add WITHIN, or declare EMIT ON WINDOW CLOSE"
+            );
+        }
+
         // v1 restrictions: PARTITION BY / ORDER BY must be plain columns, PARTITION BY non-empty.
         if self.core.partition_key_indices().is_none() || self.core.order_key_indices().is_none() {
             bail!(

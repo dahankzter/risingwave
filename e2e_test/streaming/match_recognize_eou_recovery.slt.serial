@@ -107,14 +107,26 @@ statement ok
 drop table t_eou_recover;
 
 # ---------------------------------------------------------------------------------------------
-# Scenario B: idle partition holding an emitted boundary-complete match with NO pending wakeup
-# (deliberately no WITHIN clause) -- the Task-8 missed-enumeration shape. Recovery must rebuild the
-# diff base by scanning the buffer table itself, not the wakeup-frontier index: a boundary-complete
-# match under an open quantifier (`b+`) with no WITHIN deadline and no future row keeps its buffer
-# alive (`reaches_boundary_alive`) while its frontier entry is removed (no scheduled wakeup remains).
-# Enumerating recovery from the frontier would silently skip this partition, leaving the diff base
-# without it; the next revision would then emit a bare Insert colliding with the `_match_id` the MV
-# already holds from before the crash, instead of a clean Delete/Insert.
+# Scenario B: idle partition holding an emitted boundary-complete match whose WITHIN deadline has NOT
+# yet passed at recovery time. Recovery must rebuild the diff base by enumerating the BUFFER table
+# itself (not the wakeup-frontier index): the rebuild is complete by construction -- a partition has
+# rows iff the buffer scan sees them -- and never depends on a partition still having a frontier entry.
+#
+# History / why this shape (and not the original one): the Task-8 missed-enumeration shape was an idle
+# partition whose frontier entry had been REMOVED while its buffer survived -- reachable ONLY without a
+# WITHIN clause, where a boundary-complete match under an open quantifier (`b+`) is held alive forever
+# by `reaches_boundary_alive` with no deadline to schedule a wakeup, so the frontier recompute drops
+# its entry (`new_wakeup == None`) even though its rows and its already-emitted match survive.
+# Enumerating recovery from the frontier would then skip exactly that partition. That shape is now
+# UNREACHABLE: emit-on-update MATCH_RECOGNIZE requires a WITHIN clause (rejected at plan time
+# otherwise), and under WITHIN a live match's start always carries a pending within-deadline, so the
+# frontier recompute keeps a within-wakeup entry for as long as the buffer survives (`within_wakeup`
+# is `Some` whenever a safe survivor remains) -- and once the deadline passes, the match's rows evict,
+# so there is never a "buffer alive but frontier entry absent" state to miss. There is thus no longer
+# a shape that DISTINGUISHES a buffer-table enumerator from a frontier enumerator end-to-end; this
+# documentation of why the stronger shape cannot occur is itself the regression argument, and the
+# variant below still exercises the buffer-table rebuild path: an idle partition whose emitted match
+# must be silently reseeded from the buffer at recovery, followed by a clean single-row revision.
 # ---------------------------------------------------------------------------------------------
 
 statement ok
@@ -129,6 +141,7 @@ select * from t_eou_idle_recover match_recognize (
   one row per match
   after match skip past last row
   pattern (a b+)
+  within 1000
   define a as a.v > 0, b as b.v < 0
 );
 
@@ -142,11 +155,12 @@ select n, dip from mv_eou_idle_recover;
 2 -1
 
 # Sentinel (partition 9, ts 12) advances the watermark to 11 -- past BOTH of partition 1's rows, so
-# safe_len == rows.len() for it. The match is held alive (the open `b+` quantifier could still
-# extend it, so `reaches_boundary_alive` keeps its start), so nothing evicts; but with no WITHIN
-# deadline and no future row to wait for, the watermark arm's frontier recompute finds neither a
-# row-wakeup nor a within-wakeup and removes partition 1's frontier entry -- even though its buffer,
-# and its already-emitted match, survive untouched.
+# safe_len == rows.len() for it. The match is held alive (the open `b+` quantifier could still extend
+# it, so `reaches_boundary_alive` keeps its start), so nothing evicts. Its WITHIN deadline is far in
+# the future (first row ts 10 + 1000 = 1010, well past the watermark 11), so the partition sits IDLE
+# with a still-open match -- no new rows, no near-term wakeup fires -- until recovery. (Unlike the
+# no-WITHIN shape this replaced, the frontier still holds partition 1's entry, scheduled at deadline
+# 1010; the buffer-table rebuild does not rely on that, which is the point.)
 statement ok
 insert into t_eou_idle_recover values (9, 12, 0);
 
@@ -166,24 +180,24 @@ set rw_implicit_flush to true;
 
 sleep 5s
 
-# UNCHANGED: rebuilding from the buffer table (not the now-absent frontier entry) still finds
-# partition 1's live rows and silently reseeds its emitted match -- nothing re-emitted, nothing lost.
+# UNCHANGED: rebuilding by scanning the buffer table finds partition 1's live rows and silently
+# reseeds its emitted match -- nothing re-emitted, nothing lost.
 query II rowsort
 select n, dip from mv_eou_idle_recover;
 ----
 2 -1
 
-# Extend the SAME match after recovery with a second `b` row: a genuine revision, same `_match_id`
-# (same start row) as the row above.
+# Extend the SAME match after recovery with a second `b` row (span 13 - 10 = 3, well inside the
+# WITHIN bound): a genuine revision, same `_match_id` (same start row) as the row above.
 statement ok
 insert into t_eou_idle_recover values (1, 13, -2);
 
 sleep 5s
 
 # EXACTLY ONCE: the revised row replaces the prior one via a proper Delete/Insert pair -- one row,
-# with the revised content. Had the rebuild enumerated via the (now-absent) frontier entry instead of
-# the buffer table, the diff base would have lacked this partition, and this revision would have
-# emitted a bare Insert colliding with the `_match_id` the MV already held -- a duplicate, not a
+# with the revised content. Had the rebuild left partition 1 out of the diff base (e.g. enumerating
+# from an absent frontier entry, the failure the buffer-table scan is immune to), this revision would
+# have emitted a bare Insert colliding with the `_match_id` the MV already held -- a duplicate, not a
 # clean update.
 query II rowsort
 select n, dip from mv_eou_idle_recover;

@@ -352,5 +352,23 @@ emit on window close;
 statement ok
 drop materialized view agg;
 
+# Emit-on-update (the plain form, no EMIT ON WINDOW CLOSE) keeps an in-memory provisional-match diff
+# base and a per-partition matcher cache; a WITHIN bound is what expires a match and lets its rows
+# evict, draining those structures. Without WITHIN nothing caps that in-process state as PARTITION BY
+# key cardinality grows -- unbounded process memory, not just persisted state -- so reject it at
+# CREATE time. (EMIT ON WINDOW CLOSE without WITHIN is allowed: only the persisted buffer grows there,
+# and the binder warns with a NOTICE instead.)
+statement error requires a WITHIN clause
+create materialized view bad_eou_no_within as
+select * from src match_recognize (
+  partition by id
+  order by ts
+  measures a.v as m
+  one row per match
+  after match skip past last row
+  pattern (a b)
+  define a as a.v > 0, b as b.v < 0
+);
+
 statement ok
 drop table src;
