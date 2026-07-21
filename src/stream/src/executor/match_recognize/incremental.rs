@@ -24,7 +24,8 @@
 //! `WITHIN` invariants).
 //!
 //! Matches are anchored by row *seq* rather than buffer *position* so they stay stable when earlier
-//! rows are evicted (a later task); positions are an internal detail of the current buffer.
+//! rows are evicted and finalized (see [`IncrementalMatcher::finalize_before_seq`]); positions are an
+//! internal detail of the current buffer.
 //!
 //! Freezing rule (see [`IncrementalMatcher::advance`]): a match — and the scan region behind it up
 //! to its skip-resume position — freezes only once *every* position in that region is dead at the
@@ -313,7 +314,11 @@ impl IncrementalMatcher {
             // `resume <= end_pos <= trunc_pos`, so every checked position is in the retained region.
             let resume = self.skip.next_pos(start_pos, end_pos, &m.labels);
             for p in cursor..resume {
-                if self.nfa.reaches_boundary_alive(p, trunc_pos, matcher).await? {
+                if self
+                    .nfa
+                    .reaches_boundary_alive(p, trunc_pos, matcher)
+                    .await?
+                {
                     break 'keep;
                 }
             }
@@ -417,7 +422,7 @@ impl IncrementalMatcher {
     /// `next_pos`, the scan-resume point. [`IncrementalMatcher::finalize_before_seq`] may only evict a
     /// prefix that lies within this frozen region, so the executor compares its eviction boundary
     /// against this before finalizing (and drops-and-rebuilds the matcher when eviction reaches past
-    /// it). Distinct from [`IncrementalMatcher::frozen`], which counts frozen *matches*, not positions.
+    /// it). Distinct from `frozen_count`, which counts frozen *matches*, not positions.
     pub fn frozen_prefix_len(&self) -> usize {
         self.next_pos
     }
@@ -578,7 +583,7 @@ mod tests {
     /// Regression: the inputs are NOT start-seq sorted. `provisional()` yields matches in the
     /// matcher's scan (buffer-position) order, and seqs are minted at *arrival* — so a late row that
     /// sorts earlier carries a higher seq at an earlier position, and position order diverges from
-    /// start_seq order. Here `old` holds (start 30, X) at the earlier position before (start 10, K);
+    /// `start_seq` order. Here `old` holds (start 30, X) at the earlier position before (start 10, K);
     /// `new` still holds the unchanged (start 10, K). A merge that trusted the input order would
     /// emit Insert(K), Delete(X), Delete(K) — net-removing K downstream even though it is still
     /// live. The internal sort must yield exactly Delete(X), keeping K present.
@@ -681,7 +686,7 @@ mod tests {
     /// `n` rows that each satisfy both `a` and `b`, so quantifier preference (not the predicate)
     /// decides the split — mirrors `nfa`'s own `ab_rows` helper.
     fn ab_rows(n: usize) -> Vec<BTreeSet<String>> {
-        vec![BTreeSet::from(["a".to_string(), "b".to_string()]); n]
+        vec![BTreeSet::from(["a".to_owned(), "b".to_owned()]); n]
     }
 
     fn quant(inner: Pattern, q: Quantifier, reluctant: bool) -> Pattern {
@@ -940,9 +945,9 @@ mod tests {
                 &[SeqMatch {
                     start_seq: 0,
                     end_seq: expected_end,
-                    labels: std::iter::once("a".to_string())
+                    labels: std::iter::once("a".to_owned())
                         .chain(std::iter::repeat_n(
-                            "b".to_string(),
+                            "b".to_owned(),
                             expected_end as usize - 1
                         ))
                         .collect(),
@@ -1028,7 +1033,9 @@ mod tests {
         let pre_matcher = SetMatcher::new(pre_rows.clone());
 
         let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
-        inc.advance(&[0, 1, 2, 3, 4, 5], &pre_matcher).await.unwrap();
+        inc.advance(&[0, 1, 2, 3, 4, 5], &pre_matcher)
+            .await
+            .unwrap();
         assert_eq!(
             provisional_triples(&inc),
             vec![(0, 2, labels(&["a", "b"])), (3, 5, labels(&["a", "b"]))]
@@ -1099,7 +1106,7 @@ mod tests {
     }
 
     /// THE case a positional (matcher-free) truncation rule gets wrong — do not simplify
-    /// `truncate_from_seq` back to "drop frozen matches whose end position >= trunc_pos".
+    /// `truncate_from_seq` back to "drop frozen matches whose end position >= `trunc_pos`".
     ///
     /// Pattern `(a b c d) | (a b)` (long branch preferred) over `[{a},{b},{c},{x}]`: the short
     /// branch matches `(0,2)`, and it freezes only once the `x` at position 3 kills the long branch
@@ -1326,7 +1333,9 @@ mod tests {
         let m_pre = SetMatcher::new(pre.clone());
 
         let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
-        inc.advance(&[0, 1, 2, 3, 4, 5, 6, 7, 8], &m_pre).await.unwrap();
+        inc.advance(&[0, 1, 2, 3, 4, 5, 6, 7, 8], &m_pre)
+            .await
+            .unwrap();
         assert_eq!(
             provisional_triples(&inc),
             vec![
@@ -1455,7 +1464,7 @@ mod tests {
     ///
     /// The pattern is the greedy `a b+`, whose trailing quantifier *would* keep swallowing later
     /// `b`s if a match were still open — the concrete "later rows would have extended it under
-    /// PastLastRow" shape from the brief. It cannot re-extend the finalized `a b` here, and that is
+    /// `PastLastRow`" shape from the brief. It cannot re-extend the finalized `a b` here, and that is
     /// the freezing invariant, not luck: a match only freezes once its whole scan region is dead at
     /// the boundary, and a position dead at a boundary stays dead at every larger boundary, so no
     /// appended row can revive it. Finalization then drains the frozen match's rows from

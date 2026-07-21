@@ -21,9 +21,10 @@
 //! Event-time model: rows are buffered per partition (in any arrival order). Matching is driven by
 //! the watermark on the leading `ORDER BY` column: when the watermark advances to `w`, every row
 //! with `order_key < w` is *safe* (its content is final), so the buffer is sorted by order key and
-//! the `< w` prefix is matched. A match is emitted once it is followed by another decided row (so
+//! the `< w` prefix is matched. A match becomes final once it is followed by another decided row (so
 //! the greedy match is known maximal); consumed rows are evicted. This handles out-of-order arrival
-//! within the watermark's lateness and bounds state.
+//! within the watermark's lateness and bounds state. How a final match reaches the output depends on
+//! the emit mode (see "Emission modes" below).
 //!
 //! Physical `PREV` needs no retention machinery: the binder only admits `PREV(.., k)` on variables
 //! at least `k` rows from the match start, so those reads stay inside the match span, whose rows
@@ -56,15 +57,36 @@
 //! State: the buffered rows (the raw input row plus its satisfied pattern variables) are persisted
 //! to a state table — written through on arrival, deleted on consumption — and restored on recovery.
 //!
+//! Emission modes (the `emit_on_update` flag, set by the planner): under EMIT ON WINDOW CLOSE
+//! (`emit_on_update = false`) emission is *final-only* — the completed match above is emitted as an
+//! append-only `Insert` at the watermark, and nothing is ever retracted. Under the plain form
+//! (`emit_on_update = true`) emission is a retract changelog: at each barrier every partition touched
+//! since the last barrier is re-matched over its *whole* buffer ("as if input ended now", not just the
+//! safe prefix), its provisional set is diffed against what was last emitted, and the `Delete`/`Insert`
+//! ops are yielded (keyed by `_match_id`, the match's start-row seq). In this mode the watermark path
+//! emits nothing; it only evicts, after an emit-before-finalize diff closes the same-epoch
+//! never-emitted-match hole (see the `Message::Watermark` arm). Finalization never *creates* a
+//! retraction — a match over the whole buffer cannot be invalidated by being declared final — so the
+//! diff base (`last_emitted`) is rebuilt from the buffer on recovery/rescale without re-emitting.
+//!
 //! Matching is driven by a per-partition [`IncrementalMatcher`] (kept in an in-memory `matchers`
 //! cache): each visit feeds the newly-safe rows and reads `provisional()`, which by construction
 //! equals a from-scratch `find_matches_dynamic` over the safe prefix (see the incremental module's
 //! differential oracle), so emission and eviction are byte-identical to the previous full-rescan
 //! path. The cache is a pure derivation of state-table content — dropped on recovery and on any
 //! vnode-bitmap change, and rebuilt lazily per partition by feeding its recovered buffer. It carries
-//! the live-window seqs + labels (never row data), the foundation an emit-on-update mode retracts
+//! the live-window seqs + labels (never row data) — the identities the emit-on-update diff retracts
 //! against. Eviction and empty-partition removal keep the buffer bounded to the live (unfinalized)
 //! window, so the work per watermark is bounded by that window rather than the partition's history.
+//!
+//! Incremental cost, per mode: the matcher freezes a leading prefix of matches whose scan region is
+//! dead at the current boundary and rescans only the mutable suffix, so its payoff is the frozen
+//! prefix it skips across visits. Under EMIT ON WINDOW CLOSE that payoff is nil — eviction advances the
+//! retained front to the live frontier every watermark, so the frozen prefix is dropped as fast as it
+//! forms and `next_pos` rebases back toward 0 each visit; eviction alone bounds the work, and the
+//! incrementality here is plumbing the plain form needs. Under emit-on-update it does pay off: the
+//! whole-buffer barrier diffs run between the watermark evictions, so for append-mostly input the
+//! frozen prefix persists across barriers and each diff rescans only the newly-appended suffix.
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
@@ -642,6 +664,12 @@ async fn compute_partition_emitted(
 /// The diff is deterministic in the buffer content, so running it twice with no intervening change
 /// (watermark then barrier) is a no-op the second time: the extra call only reorders the same ops
 /// earlier within the epoch, never changing what is emitted.
+///
+/// Cost note: with the watermark arm's emit-before-finalize, a dirty emit-on-update partition can have
+/// its matcher refreshed up to three times in one epoch — emit-before-finalize (whole buffer), the
+/// watermark eviction pass (safe prefix), and this barrier diff (whole buffer). Each reuses the
+/// cached, already-warm matcher rather than rescanning from scratch, and by the determinism above the
+/// repeats emit nothing new; they only move already-computed ops earlier within the epoch.
 async fn emit_partition_diff(
     inc: &mut IncrementalMatcher,
     last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
@@ -1357,9 +1385,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             if emit_on_update && dirty_partitions.contains(&partition_key) {
                                 let inc = matchers
                                     .entry(partition_key.clone())
-                                    .or_insert_with(|| {
-                                        IncrementalMatcher::new(&nfa, skip.clone())
-                                    });
+                                    .or_insert_with(|| IncrementalMatcher::new(&nfa, skip.clone()));
                                 let ops = emit_partition_diff(
                                     inc,
                                     &mut last_emitted,

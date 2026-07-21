@@ -79,8 +79,10 @@ The clause flows through the usual layers; each is a thin, conventional addition
   the operator); `ColPrunable` prunes the input to the columns the clause's expressions actually
   read. `to_stream` enforces the v1 restrictions and shards the input by the `PARTITION BY` key.
 - **Stream plan** (`stream_match_recognize.rs` + `generic/match_recognize.rs`): `StreamMatchRecognize`
-  is append-only and hash-sharded on the partition columns. It declares one internal state table (see
-  [State and fault tolerance](#state-and-fault-tolerance)).
+  is hash-sharded on the partition columns and declares three internal state tables (see
+  [State and fault tolerance](#state-and-fault-tolerance)). Its output stream kind follows the emit
+  mode: append-only under `EMIT ON WINDOW CLOSE`, retract under the plain emit-on-update form (see
+  [Emission modes](#emission-modes)).
 
 ### Lowering `MEASURES` and `DEFINE`
 
@@ -126,26 +128,76 @@ snowflake PK tiebreaker, assigned once at ingest). This is unique forever — an
 row is always evicted, so no later match can share it (the same invariant that prevents
 cross-watermark double emits) — and, unlike an id minted at emission time, it is **deterministic
 across recovery replay**: re-emitting a match after a rollback reproduces byte-identical output. A
-stable, replay-deterministic match identity is also the foundation a future emit-on-update mode
-would retract against.
+stable, replay-deterministic match identity is also the key the plain form's emit-on-update changelog
+retracts against, and what lets recovery rebuild that changelog's diff base from the buffer alone
+without persisting it (see [Emission modes](#emission-modes)).
 
-### Emit semantics
+### Emission modes
 
-The operator emits **only final matches, at the watermark** — a match is output once no late row
-can change it. In RisingWave's emit taxonomy this is Emit-On-Window-Close behavior: the plan node
-declares it (`emit_on_window_close = true`) and the query is **required** to state it — a
-`MATCH_RECOGNIZE` materialized view must be declared `EMIT ON WINDOW CLOSE`, and the plain
-(default-emit) form is rejected with guidance. The plain form is deliberately reserved: if an
-emit-on-update mode (provisional matches corrected by retractions, keyed by the deterministic
-`_match_id`) is added later, it can adopt RisingWave's default emit semantics under the plain form
-without silently changing the meaning of any existing query — every existing query is explicit by
-construction.
+The emit mode is chosen per query by the presence of `EMIT ON WINDOW CLOSE`, and the plan node
+carries it (`emit_on_update`, proto field 16). Both modes share the buffer, the NFA, and the
+matching/eviction machinery; they differ only in *when* and *how* a match reaches the output.
 
-One composition consequence: the operator does not emit a downstream watermark, so stateful
-operators that need one under Emit-On-Window-Close (e.g. an aggregation) cannot sit above
-`MATCH_RECOGNIZE` **inside the same** `EMIT ON WINDOW CLOSE` view. Compose across views instead:
-the `MATCH_RECOGNIZE` view's output is append-only, and a plain (default-emit) view can aggregate
-it. Stateless operators (projections, filters) compose freely within the same view.
+**`EMIT ON WINDOW CLOSE` — final-only.** The operator emits **only final matches, at the watermark**:
+a match is output — as an `Insert`, so the output is append-only — once a later safe row confirms the
+greedy match is maximal and no late row can still change it. This is RisingWave's Emit-On-Window-Close
+behavior; the plan node declares it (`emit_on_window_close = true`) so a query naming
+`EMIT ON WINDOW CLOSE` gets exactly this.
+
+**Plain form — emit-on-update.** Without `EMIT ON WINDOW CLOSE`, the operator emits under RisingWave's
+default semantics: a **retract changelog**, corrected as the picture fills in. The model is
+whole-buffer, not safe-prefix. At each barrier, every partition that received rows since the last
+barrier is re-matched over its *entire* buffer ("as if input ended now"), yielding a *provisional*
+match set; that set is diffed against the set the operator last emitted for the partition, and the
+difference is emitted. The changelog is keyed by `_match_id` (the match's start-row seq), so the diff
+is by identity:
+
+- a match present now but not before (a new start) → `Insert`;
+- a match present before but not now (its start no longer begins any match) → `Delete`;
+- a match present in both whose extent, labels, or output row changed → `Delete(old)` then
+  `Insert(new)` under the same key;
+- an unchanged match → nothing.
+
+The watermark's role shrinks to **finalization**: it evicts rows that can no longer belong to any
+match, which is what lets a provisional match settle and stop being re-diffed. It never emits in this
+mode.
+
+**Emit-before-finalize (watermark ordering).** Within an epoch the message order is
+Chunk → Watermark → Barrier. A match whose rows all arrive in *this* epoch and become watermark-safe
+now would be evicted by the watermark before any barrier had diffed the partition — its `Insert` would
+never be emitted, and the following barrier would see the rows already gone (nothing to diff),
+permanently losing a real match. So in emit-on-update mode the watermark path runs the same
+whole-buffer diff **before** it evicts; every match that finalization removes from the diffable set has
+thus already been emitted before its rows leave. The diff is deterministic in the buffer content, so
+running it at the watermark and again at the barrier is not a double emit — the second run sees no
+change and is a no-op, it only pulls the same ops earlier within the epoch.
+
+**Finalization never creates a retraction.** A match computed over the whole buffer stays valid when
+the watermark later declares it final: finality removes future *revisability*, it cannot invalidate a
+match already computed over the rows that exist. So the watermark path only ever *drops* a finalized
+match from the diff base (a permanent result — no op emitted); a `Delete` arises only from the barrier
+diff, when genuinely later input supersedes a still-provisional match. Every retraction therefore
+corrects a match the operator itself had emitted.
+
+**Recovery without an emission state table.** The operator persists no changelog and no last-emitted
+state — only the raw buffer (see [State and fault tolerance](#state-and-fault-tolerance)). The
+emit-on-update diff base is in-memory, and after a crash or a rescale it is rebuilt by recomputing each
+owned partition's provisional set from the restored buffer and seeding the base with it, emitting
+nothing. This is sound precisely because both the match identity (`_match_id` = start-row seq) and each
+match's output row are **deterministic functions of the buffer**: the recomputed set is byte-identical
+to what the pre-crash actor last emitted for the same committed buffer, so it already equals the rows
+downstream holds at the recovered epoch. Seeding the base to that set means the next barrier emits only
+genuine new deltas — no duplicate `Insert`s, no spurious `Delete`s. A persisted emission state table
+would be redundant: it could only store what the buffer already determines, at the cost of a second
+table to write every barrier. The trade is recovery-time recomputation (one matcher pass per owned
+partition at startup) for zero steady-state write amplification.
+
+One composition consequence carries over from Emit-On-Window-Close: that mode emits no downstream
+watermark, so a stateful operator that needs one (e.g. an aggregation) cannot sit above
+`MATCH_RECOGNIZE` **inside the same** `EMIT ON WINDOW CLOSE` view; compose across views instead (the
+view's output is append-only, and a downstream default-emit view can aggregate it). The plain
+emit-on-update form outputs an ordinary retract stream and composes like any other default-emit
+materialized view. Stateless operators (projections, filters) compose freely within either.
 
 ## The NFA
 
@@ -175,15 +227,18 @@ to keep the factorial bounded).
   first entry past `w`), then for each candidate partition reads just that partition from the buffer
   table with `iter_with_prefix`, in PK order — `(partition, order_key, seq)`, already `ORDER BY`
   ordered, so no in-memory sort. Every row with `order_key < w` is final; the matcher runs over the
-  safe prefix. A match is emitted once a later safe row follows it (so the greedy match is known
+  safe prefix. A match becomes final once a later safe row follows it (so the greedy match is known
   maximal), **or immediately if the finder's preferred result can no longer change** — no path the
   finder prefers over the current accepting one could become accepting with more rows, as for a
   fixed `(a b)`, an ordered alternation whose first-listed branch already accepted, or a reluctant
   quantifier's short result. That wait would otherwise starve an idle partition forever. The check
   follows the matcher's preference order exactly (`Nfa::may_extend`): a lower-priority path — a
   later-listed alternation branch, a greedy loop the finder already exited on real data — never
-  holds a match. `AFTER MATCH SKIP` decides where the scan resumes. Matches stream straight into a
-  `StreamChunkBuilder`, flushed a chunk at a time. After processing, the partition's frontier entry is
+  holds a match. `AFTER MATCH SKIP` decides where the scan resumes. Under `EMIT ON WINDOW CLOSE` the
+  final match is emitted here, streaming straight into a `StreamChunkBuilder` flushed a chunk at a
+  time; under the plain form the watermark path emits nothing and only evicts, emission having
+  happened at barriers (see [Emission modes](#emission-modes)). After processing, the partition's
+  frontier entry is
   recomputed (the earlier of its next future row and the earliest WITHIN expiry of a retained
   partial) or dropped. Work per watermark is therefore proportional to the
   partitions that need attention, not to the number of live partitions; the working set is the largest
@@ -213,10 +268,20 @@ to keep the factorial bounded).
   `WITHIN` is woken by the deadline term (see [The wakeup frontier](#the-wakeup-frontier)) when that
   partial times out, so its dead rows are released even with no further input.
 
-Matching is **not incremental**: each advancing watermark re-runs the matcher from the start of the
-buffer rather than resuming partial NFA state. Eviction keeps that work bounded by the live window
-rather than the partition's history; carrying incremental NFA state across watermarks is possible
-future work.
+Matching is **incremental**. Each partition keeps a cached `IncrementalMatcher`
+(`src/stream/src/executor/match_recognize/incremental.rs`) that feeds newly appended rows and rescans
+only the mutable suffix behind the last frozen match, rather than re-running the whole buffer. A
+leading run of matches *freezes* once its entire scan region is dead at the current boundary — per the
+same `reaches_boundary_alive` liveness predicate eviction uses — so a frozen match can never change
+under later appends and is never rescanned; work is proportional to the newly-safe rows, not the live
+window. The cache is a pure derivation of the buffer (live-window seqs and per-row labels only, never
+row data): dropped on recovery and on any vnode-bitmap change, rebuilt lazily per partition by
+re-feeding the restored buffer, and its `provisional()` set is by construction byte-identical to a
+from-scratch scan over the same rows. How much the incrementality saves is mode-dependent — under
+`EMIT ON WINDOW CLOSE` eviction trims the frozen prefix as fast as it forms, so there is no cross-visit
+saving; under emit-on-update the whole-buffer barrier diffs run between evictions, so for append-mostly
+input the frozen prefix persists across barriers and each diff rescans only the newly-appended suffix
+(see [Emission modes](#emission-modes)).
 
 ### The watermark boundary is strict
 
@@ -308,7 +373,10 @@ SharedBuffer.)
 
 - **Recovery.** The state table is authoritative, so there is no in-memory buffer to rebuild: after
   recovery the next watermark simply scans the (restored) state table per owned vnode (an empty-prefix
-  scan cannot compute a vnode on a distributed table).
+  scan cannot compute a vnode on a distributed table). In emit-on-update mode the one derived structure
+  that would otherwise re-emit — the last-emitted diff base — is rebuilt from the restored buffer before
+  any input is processed; by determinism this reproduces exactly what downstream already holds, so
+  recovery re-emits nothing (see [Emission modes](#emission-modes)).
 - **Rescaling.** On a vnode-bitmap change the set of partitions an actor owns shifts; the state table
   migrates the affected vnodes, and the next watermark scans whatever the actor now owns. There is no
   in-memory cache to reload or drop.
@@ -372,7 +440,9 @@ configurable age, trading completeness for a hard bound) is possible future work
 ## Limitations and future work
 
 - `ALL ROWS PER MATCH`, batch execution, and non-append-only input are not supported.
-- Matching is non-incremental (re-runs over the live window per watermark).
+- The incremental matcher's cross-visit CPU saving is realized only in emit-on-update mode; under
+  `EMIT ON WINDOW CLOSE`, eviction trims the frozen prefix each watermark, so it saves nothing there
+  (see [The executor](#the-executor)).
 - Without a `WITHIN` clause, unmatched partials are retained indefinitely, so persisted state is
   bounded only by `PARTITION BY` key cardinality (see [State bound and `WITHIN`](#state-bound-and-within));
   the binder emits a `NOTICE` in that case.
