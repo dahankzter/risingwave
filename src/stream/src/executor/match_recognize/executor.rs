@@ -108,7 +108,7 @@ use risingwave_pb::stream_plan::{
 use risingwave_storage::StateStore;
 use risingwave_storage::store::PrefetchOptions;
 
-use super::incremental::{IncrementalMatcher, SeqMatch, diff_provisional};
+use super::incremental::{IncrementalMatcher, SeqMatch, diff_provisional, plan_provisional_rows};
 use super::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipDegradation, SkipMode};
 use crate::common::table::state_table::StateTable;
 use crate::executor::prelude::*;
@@ -619,17 +619,38 @@ async fn build_match_row(
         .into_owned_row())
 }
 
+/// Refresh a partition's cached matcher over the *whole* buffer — in emit-on-update the match window
+/// is all data-so-far ("as if input ended now"), not the watermark-safe prefix — and return the
+/// seq→buffer-position index used to map each seq-anchored provisional match back to its rows for
+/// measure evaluation. Shared by the two emit-on-update derivations so they scan identically:
+/// [`emit_partition_diff`] (the barrier diff) and [`compute_partition_emitted`] (the recovery reseed).
+/// `rows` is the partition's buffer, already read by the caller, and must be non-empty; `inc` is the
+/// partition's cached matcher (`matchers.entry(..)`), left refreshed over the whole buffer.
+async fn refresh_partition_matcher(
+    inc: &mut IncrementalMatcher,
+    rows: &[BufferedRow],
+    defines: &HashMap<String, CompiledDefine>,
+    within: Option<&NonStrictExpression>,
+) -> StreamExecutorResult<HashMap<i64, usize>> {
+    let safe_len = rows.len();
+    let matcher = DefineMatcher {
+        rows,
+        safe_len,
+        defines,
+        within,
+    };
+    refresh_matcher(inc, rows, safe_len, &matcher).await?;
+    let mut seq_to_pos: HashMap<i64, usize> = HashMap::with_capacity(safe_len);
+    for (p, r) in rows.iter().enumerate() {
+        seq_to_pos.insert(r.seq, p);
+    }
+    Ok(seq_to_pos)
+}
+
 /// Compute one partition's current emit-on-update provisional set as `(match, output row)` pairs,
-/// WITHOUT diffing or touching `last_emitted`. Refreshes the matcher over the *whole* buffer (in
-/// emit-on-update the match window is all data-so-far — "as if input ended now" — not the
-/// watermark-safe prefix), then rebuilds each provisional match's output row. `rows` is the
-/// partition's buffer, already read by the caller, and must be non-empty. `inc` is the partition's
-/// cached matcher (`matchers.entry(..)`); the helper refreshes it over the whole buffer and leaves
-/// it there.
-///
-/// This is the "compute" half shared by two uses so they produce byte-identical sets:
-/// * [`emit_partition_diff`] — diffs this set against the base and advances it (the emit path);
-/// * [`rebuild_last_emitted`] — seeds the base with this set on recovery/rescale, emitting nothing.
+/// WITHOUT diffing or touching `last_emitted`, building EVERY match's output row fresh. Used by
+/// [`rebuild_last_emitted`] to seed the base on recovery/rescale — there is no prior base to reuse
+/// rows from, so all rows are built — emitting nothing.
 ///
 /// Deterministic in the buffer content: the same buffer yields the same matcher feed, the same
 /// `provisional()`, and the same `build_match_row` output rows. That determinism is what lets the
@@ -642,22 +663,7 @@ async fn compute_partition_emitted(
     within: Option<&NonStrictExpression>,
     measures: &[CompiledMeasure],
 ) -> StreamExecutorResult<Vec<(SeqMatch, OwnedRow)>> {
-    // In emit-on-update the whole buffer is the match window.
-    let safe_len = rows.len();
-    let matcher = DefineMatcher {
-        rows,
-        safe_len,
-        defines,
-        within,
-    };
-    refresh_matcher(inc, rows, safe_len, &matcher).await?;
-
-    // Rebuild the current provisional set as `(match, output row)`, mapping each seq-anchored match
-    // back to its buffer position for measure evaluation.
-    let mut seq_to_pos: HashMap<i64, usize> = HashMap::with_capacity(safe_len);
-    for (p, r) in rows.iter().enumerate() {
-        seq_to_pos.insert(r.seq, p);
-    }
+    let seq_to_pos = refresh_partition_matcher(inc, rows, defines, within).await?;
     let mut new_emitted: Vec<(SeqMatch, OwnedRow)> = Vec::with_capacity(inc.provisional().len());
     for m in inc.provisional() {
         let start = seq_to_pos[&m.start_seq];
@@ -667,27 +673,27 @@ async fn compute_partition_emitted(
     Ok(new_emitted)
 }
 
-/// Compute one partition's emit-on-update changelog: recompute its provisional set over the whole
-/// buffer (via [`compute_partition_emitted`]), diff against the last-emitted base, and advance the
-/// base to the new set. Returns the `Delete`/`Insert` ops for the caller to stream — a plain async
-/// fn cannot `yield` — while updating `last_emitted` and the cached matcher in place. `rows` is the
-/// partition's buffer, already read by the caller, and must be non-empty (the caller handles the
-/// drained-partition case, where there is nothing to diff).
+/// Compute one partition's emit-on-update changelog: refresh the matcher over the whole buffer, diff
+/// the new provisional set against the last-emitted base, and advance the base to it. Returns the
+/// `Delete`/`Insert` ops for the caller to stream — a plain async fn cannot `yield` — while updating
+/// `last_emitted` and the cached matcher in place. `rows` is the partition's buffer, already read by
+/// the caller, and must be non-empty (the caller handles the drained-partition case).
+///
+/// Output rows are built lazily: [`plan_provisional_rows`] classifies each new match against the base
+/// first, and the (expensive) `build_match_row` runs ONLY for a brand-new or content-changed
+/// identity; an unchanged match reuses the base's stored row (byte-identical by construction). In the
+/// steady state a partition's provisional set is unchanged barrier-to-barrier, so this rebuilds
+/// nothing.
 ///
 /// Shared by two callers so they produce byte-identical output and stay in lockstep:
 /// * the barrier arm — the normal emit-on-update path, diffing every dirty partition before commit;
 /// * the watermark arm's emit-before-finalize — which runs this first, before eviction removes any
 ///   rows, to close the never-emitted-match hole (see that call site).
 ///
-/// The diff is deterministic in the buffer content, so running it twice with no intervening change
-/// (watermark then barrier) is a no-op the second time: the extra call only reorders the same ops
-/// earlier within the epoch, never changing what is emitted.
-///
-/// Cost note: with the watermark arm's emit-before-finalize, a dirty emit-on-update partition can have
-/// its matcher refreshed up to three times in one epoch — emit-before-finalize (whole buffer), the
-/// watermark eviction pass (safe prefix), and this barrier diff (whole buffer). Each reuses the
-/// cached, already-warm matcher rather than rescanning from scratch, and by the determinism above the
-/// repeats emit nothing new; they only move already-computed ops earlier within the epoch.
+/// The diff is deterministic in the buffer content. A partition handled by the watermark arm's
+/// emit-before-finalize is cleared from `dirty_partitions` there, so the barrier no longer re-diffs
+/// it — that re-diff was a guaranteed no-op (see the call site). A partition NOT woken this epoch is
+/// still diffed here at the barrier.
 async fn emit_partition_diff(
     inc: &mut IncrementalMatcher,
     last_emitted: &mut HashMap<OwnedRow, Vec<(SeqMatch, OwnedRow)>>,
@@ -697,17 +703,31 @@ async fn emit_partition_diff(
     within: Option<&NonStrictExpression>,
     measures: &[CompiledMeasure],
 ) -> StreamExecutorResult<Vec<(Op, OwnedRow)>> {
-    let new_emitted =
-        compute_partition_emitted(inc, partition_key, rows, defines, within, measures).await?;
+    let seq_to_pos = refresh_partition_matcher(inc, rows, defines, within).await?;
+    let provisional = inc.provisional();
 
-    // Diff the current provisional set against the diff base, then advance the base to it.
-    let ops = {
-        let prev = last_emitted
-            .get(partition_key)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        diff_provisional(prev, &new_emitted)
-    };
+    // Classify each new match against the base BEFORE building any row: reuse the base's stored
+    // output row for an unchanged identity, (re)build only for a new or content-changed one.
+    let prev = last_emitted
+        .get(partition_key)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let plan = plan_provisional_rows(prev, provisional);
+    let mut new_emitted: Vec<(SeqMatch, OwnedRow)> = Vec::with_capacity(provisional.len());
+    for (m, reuse) in provisional.iter().zip(plan) {
+        let out_row = match reuse {
+            Some(i) => prev[i].1.clone(),
+            None => {
+                let start = seq_to_pos[&m.start_seq];
+                build_match_row(measures, rows, partition_key, start, &m.labels).await?
+            }
+        };
+        new_emitted.push((m.clone(), out_row));
+    }
+
+    // Ops in `diff_provisional`'s order (start-seq ascending, Delete-before-Insert per revision); the
+    // base then advances to the new set.
+    let ops = diff_provisional(prev, &new_emitted);
     last_emitted.insert(partition_key.clone(), new_emitted);
     Ok(ops)
 }
@@ -1429,6 +1449,17 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                         yield Message::Chunk(c);
                                     }
                                 }
+                                // This partition's provisional changelog is now emitted and
+                                // `last_emitted` advanced to its whole-buffer set. The eviction below
+                                // only prunes finalized matches from that base WITHOUT a retract, so
+                                // the base stays consistent with the post-eviction buffer. Within an
+                                // epoch the message order is Chunk -> Watermark -> Barrier, so no chunk
+                                // can re-dirty this partition before the barrier — meaning the
+                                // barrier's re-read + re-diff of it would be a guaranteed no-op (same
+                                // surviving buffer, same pruned base, byte-identical rows). Clear it so
+                                // the barrier skips that wasted pass; a partition NOT woken this
+                                // watermark stays dirty and is diffed at the barrier as usual.
+                                dirty_partitions.remove(&partition_key);
                             }
 
                             // The prefix with leading `order_key < w` is final. Strictly below `w`:

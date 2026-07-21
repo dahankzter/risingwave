@@ -43,6 +43,7 @@
 //! sorted suffix through `advance`.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use risingwave_common::array::Op;
 use risingwave_common::row::OwnedRow;
@@ -128,6 +129,38 @@ pub fn diff_provisional(
         ops.push((Op::Insert, nrow.clone()));
     }
     ops
+}
+
+/// The row-independent half of the emit-on-update diff: decide, per new provisional match, whether
+/// its output row can be reused from the base or must be (re)built — *before* building any row.
+///
+/// Returned positionally over `new`: `Some(i)` means base entry `old[i]` holds a byte-identical
+/// output row to reuse; `None` means a fresh row must be built. Reuse is sound exactly when identity
+/// (`start_seq`) and content (`end_seq`, `labels`) all match: the output row is a pure function of the
+/// append-only matched rows plus their labels, so an identical `(start_seq, end_seq, labels)` triple
+/// pins byte-identical rows. (A late row landing *inside* the span would make the contiguous match
+/// cover one more position, lengthening `labels`; a row landing *outside* the span shifts positions
+/// but leaves the covered rows' seqs and values untouched — append-only rows never change.)
+///
+/// This lets the executor call the expensive `build_match_row` only for `None` entries: in the steady
+/// state a partition's provisional set is unchanged barrier-to-barrier, so every entry reuses and
+/// nothing is rebuilt. The changelog is still assembled by [`diff_provisional`] in the same order;
+/// because a reused row equals its base row and a changed match differs in `end_seq`/`labels`,
+/// `diff_provisional`'s row-inequality tie-break never independently fires on the executor path (it
+/// remains live only for synthetic-row callers such as the unit tests).
+pub fn plan_provisional_rows(old: &[(SeqMatch, OwnedRow)], new: &[SeqMatch]) -> Vec<Option<usize>> {
+    let mut by_seq: HashMap<i64, usize> = HashMap::with_capacity(old.len());
+    for (i, (m, _)) in old.iter().enumerate() {
+        by_seq.insert(m.start_seq, i);
+    }
+    new.iter()
+        .map(|m| {
+            by_seq
+                .get(&m.start_seq)
+                .copied()
+                .filter(|&i| old[i].0.end_seq == m.end_seq && old[i].0.labels == m.labels)
+        })
+        .collect()
 }
 
 /// Incremental wrapper around [`Nfa::find_matches_dynamic`] for append-only input.
@@ -470,7 +503,7 @@ mod tests {
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::ScalarImpl;
 
-    use super::{IncrementalMatcher, SeqMatch, diff_provisional};
+    use super::{IncrementalMatcher, SeqMatch, diff_provisional, plan_provisional_rows};
     use crate::executor::error::StreamExecutorResult;
     use crate::executor::match_recognize::nfa::{
         CandidateMatcher, Nfa, Pattern, Quantifier, SetMatcher, SkipMode,
@@ -583,6 +616,39 @@ mod tests {
         // ...so seeding `last_emitted` with it and re-diffing (as the next barrier would over an
         // unchanged buffer) re-emits nothing — the silent rebuild is exact, not approximate.
         assert_eq!(diff_provisional(&pre_base, &rec_set), vec![]);
+    }
+
+    /// The row-independent classification the executor runs before building any output row. An
+    /// unchanged provisional set must reuse every base row (all `Some`, zero rebuilds — the
+    /// steady-state win); a same-`start_seq` match with a changed extent or changed labels, and a
+    /// brand-new start, must each rebuild (`None`).
+    #[test]
+    fn plan_reuses_unchanged_and_rebuilds_changed() {
+        let base = vec![
+            (dm(5, 7, &["a", "b"]), orow(100)),
+            (dm(10, 12, &["a", "b"]), orow(200)),
+        ];
+
+        // Identical provisional set (order need not match the base): every row reused, none rebuilt.
+        let same = vec![dm(10, 12, &["a", "b"]), dm(5, 7, &["a", "b"])];
+        let plan = plan_provisional_rows(&base, &same);
+        assert_eq!(plan, vec![Some(1), Some(0)]);
+        assert!(
+            plan.iter().all(Option::is_some),
+            "an unchanged provisional set must rebuild no output rows"
+        );
+
+        // Changed extent (same start), changed labels (same start+extent), and a brand-new start:
+        // each must be rebuilt.
+        let changed = vec![
+            dm(5, 9, &["a", "b", "b"]), // start 5: extent 7 -> 9
+            dm(10, 12, &["b", "b"]),    // start 10: labels [a,b] -> [b,b]
+            dm(20, 22, &["a", "b"]),    // brand-new start
+        ];
+        assert_eq!(
+            plan_provisional_rows(&base, &changed),
+            vec![None, None, None]
+        );
     }
 
     /// Same extent and labels, but the evaluated output row changed — still a revision (the diff
