@@ -164,8 +164,8 @@ pub use join::{AsOfDesc, AsOfJoinType, JoinType};
 pub use lookup::*;
 pub use lookup_union::LookupUnionExecutor;
 pub use match_recognize::{
-    CompiledDefine, CompiledMeasure, IncrementalMatcher, MatchRecognizeExecutor,
-    MatchRecognizeExecutorArgs, Nfa, SeqMatch, SkipMode, pattern_from_protobuf,
+    CompiledDefine, CompiledMeasure, MatchRecognizeExecutor, MatchRecognizeExecutorArgs, Nfa,
+    SkipMode, pattern_from_protobuf,
 };
 pub use merge::MergeExecutor;
 pub(crate) use merge::{MergeExecutorInput, MergeExecutorUpstream};

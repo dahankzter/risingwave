@@ -24,6 +24,5 @@ mod proto;
 pub use executor::{
     CompiledDefine, CompiledMeasure, MatchRecognizeExecutor, MatchRecognizeExecutorArgs,
 };
-pub use incremental::{IncrementalMatcher, SeqMatch};
 pub use nfa::{Nfa, SkipMode};
 pub use proto::pattern_from_protobuf;

@@ -208,6 +208,23 @@ impl IncrementalMatcher {
             return Ok(());
         }
         self.seq_index.extend_from_slice(new_row_seqs);
+        self.rescan(matcher).await
+    }
+
+    /// Re-derive the provisional tail over the already-fed mutable suffix `[next_pos, n_rows)`
+    /// without feeding new rows — the rescan half of [`IncrementalMatcher::advance`], exposed for
+    /// the one caller shape where a rescan must happen with nothing to feed: an **over-feed
+    /// rollback**. When rows beyond the caller's current window were fed (e.g. an emit-on-update
+    /// whole-buffer feed followed by a watermark visit over just the safe prefix),
+    /// [`IncrementalMatcher::truncate_from_seq`] at the first over-fed row rolls the tail back but
+    /// also drops every provisional match over the *retained* fed suffix; those rows are still fed,
+    /// so there is nothing to `advance` (re-feeding them would double-enter `seq_index`) and the
+    /// dropped matches must be re-derived in place. After this call `provisional()` equals a
+    /// from-scratch batch scan of the fed rows.
+    pub async fn rescan(
+        &mut self,
+        matcher: &(impl CandidateMatcher + Sync),
+    ) -> StreamExecutorResult<()> {
         let n_rows = self.seq_index.len();
 
         // Rescan the mutable suffix only. The offset matcher maps suffix-relative positions produced
@@ -643,7 +660,9 @@ mod tests {
     }
 
     /// Oracle: feeding rows incrementally (in any split) must equal one batch
-    /// `find_matches_dynamic` over the same rows.
+    /// `find_matches_dynamic` over the same rows — compared as full `(start, end, labels)` triples
+    /// (like [`assert_equiv_with`]), so a *steal* (a row rebinding to a different variable under an
+    /// unchanged span) is caught, not just span changes.
     async fn assert_equiv(
         nfa: &Nfa,
         skip: SkipMode,
@@ -651,10 +670,6 @@ mod tests {
         split_at: &[usize],
     ) {
         let matcher = SetMatcher::new(rows.to_vec());
-        let batch = nfa
-            .find_matches_dynamic(rows.len(), &matcher, &skip)
-            .await
-            .unwrap();
         let mut inc = IncrementalMatcher::new(nfa, skip.clone());
         let mut fed = 0usize;
         for &cut in split_at.iter().chain(std::iter::once(&rows.len())) {
@@ -662,13 +677,10 @@ mod tests {
             inc.advance(&seqs, &matcher).await.unwrap();
             fed = cut;
         }
-        let inc_matches: Vec<(usize, usize)> = inc
-            .provisional()
-            .iter()
-            .map(|m| (m.start_seq as usize, m.end_seq as usize))
-            .collect();
-        let batch_matches: Vec<(usize, usize)> = batch.iter().map(|m| (m.start, m.end)).collect();
-        assert_eq!(inc_matches, batch_matches);
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(nfa, &skip, rows).await
+        );
     }
 
     fn sets(labels: &[&str]) -> BTreeSet<String> {
@@ -1526,17 +1538,157 @@ mod tests {
             "finalized match start must never be revisited"
         );
 
-        // The diff against the pruned base emits no op referencing the finalized start (its base row
-        // is orow(0)); the only ops revise the surviving match (seq 2), whose extent changed.
+        // The diff against the pruned base is exactly the surviving match's revision — a
+        // Delete/Insert pair of its row (orow(2), extent 4 -> 5) — and nothing else; in particular
+        // no op references the finalized start (whose base row was orow(0)).
         let new_emitted: Vec<(SeqMatch, OwnedRow)> = inc
             .provisional()
             .iter()
             .map(|m| (m.clone(), orow(m.start_seq)))
             .collect();
         let ops = diff_provisional(&base_pruned, &new_emitted);
-        assert!(
-            ops.iter().all(|(_, row)| row != &orow(0)),
-            "no diff op may touch the finalized match"
+        assert_eq!(ops, vec![(Op::Delete, orow(2)), (Op::Insert, orow(2))]);
+    }
+
+    /// Why the executor must NOT call `finalize_before_seq` under the overlapping skip modes: with
+    /// `SKIP TO NEXT ROW` the resume point precedes the match end (`resume == start + 1 < end`), so
+    /// a FROZEN match's span can extend past the frozen prefix (`frozen_prefix_len()` is the resume
+    /// point, not the span end). `pattern (a a)` over three qualifying rows: (0,2) freezes with a
+    /// frozen prefix of 1 — position 0 is dead (the pattern is exactly two rows), but positions 1..2
+    /// were never liveness-checked — while (1,3) ends at the boundary and stays alive. The
+    /// executor's eviction boundary is the first alive position (1, exactly the frozen prefix), and
+    /// the frozen (0,2) straddles it: finalizing there must trip the no-straddle debug assertion.
+    /// This is the contract violation the executor avoids by restricting its finalize path to
+    /// `PAST LAST ROW` and dropping-and-rebuilding the matcher for the overlapping modes (see the
+    /// eviction arm in `executor.rs`, and the positive drop-and-rebuild test below).
+    #[tokio::test]
+    #[should_panic(expected = "straddles finalization boundary")]
+    async fn finalize_under_to_next_row_straddles_frozen_match() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("a".into())]);
+        let nfa = Nfa::compile(&pat);
+        let rows = from_str("aaa");
+        let matcher = SetMatcher::new(rows.clone());
+
+        let mut inc = IncrementalMatcher::new(&nfa, SkipMode::ToNextRow);
+        inc.advance(&[0, 1, 2], &matcher).await.unwrap();
+        // Overlapping matches (0,2) and (1,3); only (0,2) froze, and the frozen prefix (its resume
+        // point, 1) sits strictly inside its span [0, 2).
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "a"])), (1, 3, labels(&["a", "a"]))]
+        );
+        assert_eq!(inc.frozen(), 1);
+        assert_eq!(inc.frozen_prefix_len(), 1);
+        // The executor-shaped call: evict before the first alive position (seq 1). The frozen (0,2)
+        // straddles that boundary — must panic.
+        inc.finalize_before_seq(1);
+    }
+
+    /// The executor's alternative under the overlapping skip modes — drop the matcher at the
+    /// straddle-shaped eviction and rebuild it from the surviving rows — is oracle-correct: a FRESH
+    /// matcher fed the surviving rows equals the batch answer over them, and its union with the
+    /// evicted (already-emitted/finalized) match equals the batch answer over the full input.
+    #[tokio::test]
+    async fn to_next_row_drop_and_rebuild_across_eviction_equals_batch() {
+        let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("a".into())]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::ToNextRow;
+
+        // Same shape as the should_panic test above: matches (0,2) frozen, (1,3) boundary-held.
+        let full = from_str("aaa");
+        let m_full = SetMatcher::new(full.clone());
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2], &m_full).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "a"])), (1, 3, labels(&["a", "a"]))]
+        );
+        // The executor evicts rows [0..1) (position 1, the boundary-held (1,3)'s start, is the
+        // first alive position) and — because the frozen (0,2) straddles that boundary — drops the
+        // matcher instead of finalizing. The evicted (0,2) was already delivered (emitted under
+        // EOWC; pruned from the diff base without a retract under EOU).
+        let evicted = provisional_triples(&inc)[0].clone();
+        drop(inc);
+
+        // Rebuild: a fresh matcher fed the surviving rows (seqs 1, 2), with the matcher indexing
+        // the rebased surviving buffer `full[1..]` — exactly what the executor's next visit does.
+        let m_tail = SetMatcher::new(full[1..].to_vec());
+        let mut rebuilt = IncrementalMatcher::new(&nfa, skip.clone());
+        rebuilt.advance(&[1, 2], &m_tail).await.unwrap();
+
+        // Oracle over the surviving rows (batch positions shifted by the eviction offset to line up
+        // with the surviving seqs).
+        let shifted_batch: Vec<(usize, usize, Vec<String>)> =
+            batch_triples(&nfa, &skip, &full[1..])
+                .await
+                .into_iter()
+                .map(|(s, e, ls)| (s + 1, e + 1, ls))
+                .collect();
+        assert_eq!(provisional_triples(&rebuilt), shifted_batch);
+        assert_eq!(
+            provisional_triples(&rebuilt),
+            vec![(1, 3, labels(&["a", "a"]))]
+        );
+
+        // Union of the evicted match and the rebuilt provisional set equals the batch answer over
+        // the full input — nothing lost, nothing duplicated across the eviction.
+        let mut union = vec![evicted];
+        union.extend(provisional_triples(&rebuilt));
+        assert_eq!(union, batch_triples(&nfa, &skip, &full).await);
+    }
+
+    /// The `refresh_matcher` over-feed rollback shape (see `executor.rs`): under emit-on-update the
+    /// whole buffer is fed at a barrier, then the watermark's eviction visit narrows back to the
+    /// safe prefix — `truncate_from_seq` at the first over-fed row rolls the tail back, but it also
+    /// drops the provisional matches over the *retained* fed suffix, and with nothing left to
+    /// re-feed no `advance` follows to re-derive them. `rescan` must restore the invariant:
+    /// `provisional()` equals the batch answer over the safe prefix, labels included.
+    #[tokio::test]
+    async fn overfeed_rollback_rescan_equals_batch_over_safe_prefix() {
+        let pat = Pattern::Concat(vec![
+            Pattern::Var("a".into()),
+            quant(Pattern::Var("b".into()), Quantifier::Plus, false),
+        ]);
+        let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::PastLastRow;
+
+        // 0:a 1:b 2:a 3:b 4:b — whole-buffer matches (0,2) (frozen: the `a` at 2 breaks the greedy
+        // `b+`) and (2,5) (trailing, provisional).
+        let full = from_str("ababb");
+        let m_full = SetMatcher::new(full.clone());
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+        inc.advance(&[0, 1, 2, 3, 4], &m_full).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (2, 5, labels(&["a", "b", "b"]))]
+        );
+        assert_eq!(inc.frozen(), 1);
+
+        // Roll back to the safe prefix [0, 4): truncate at the first over-fed row's seq. This drops
+        // the provisional (2,5) even though rows 2 and 3 stay fed — the reason a rescan (and not a
+        // re-feed, which would double-enter the retained rows in `seq_index`) must follow.
+        let m_safe = SetMatcher::new(full[..4].to_vec());
+        inc.truncate_from_seq(4, &m_safe).await.unwrap();
+        assert_eq!(provisional_triples(&inc), vec![(0, 2, labels(&["a", "b"]))]);
+
+        // Rescan re-derives the dropped suffix matches in place: `provisional()` now equals the
+        // batch answer over the safe prefix — the invariant the executor's eviction pass reads.
+        inc.rescan(&m_safe).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &full[..4]).await
+        );
+        assert_eq!(
+            provisional_triples(&inc),
+            vec![(0, 2, labels(&["a", "b"])), (2, 4, labels(&["a", "b"]))]
+        );
+
+        // Re-feeding the rolled-back row (the next barrier's whole-buffer feed) still equals the
+        // batch over the whole buffer — the rollback+rescan corrupted nothing.
+        inc.advance(&[4], &m_full).await.unwrap();
+        assert_eq!(
+            provisional_triples(&inc),
+            batch_triples(&nfa, &skip, &full).await
         );
     }
 }

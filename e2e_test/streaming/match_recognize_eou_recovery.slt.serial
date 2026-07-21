@@ -68,7 +68,7 @@ set rw_implicit_flush to true;
 
 # Post-recovery watermark/cache processing is asynchronous relative to `wait` (existing lesson from
 # the EOWC recovery serial); give it a margin before the first post-recovery query.
-sleep 3s
+sleep 5s
 
 # UNCHANGED: the rebuild recomputed the same provisional set from the recovered buffer and silently
 # reseeded the diff base -- byte-identical to the pre-crash row, nothing re-emitted or lost.
@@ -81,7 +81,7 @@ select n, bv from mv_eou_recover;
 statement ok
 insert into t_eou_recover values (1, 3, -2);
 
-sleep 3s
+sleep 5s
 
 query II rowsort
 select n, bv from mv_eou_recover;
@@ -93,7 +93,7 @@ select n, bv from mv_eou_recover;
 statement ok
 insert into t_eou_recover values (2, 300, 5);
 
-sleep 3s
+sleep 5s
 
 query II rowsort
 select n, bv from mv_eou_recover where n is not null and bv is not null;
@@ -164,7 +164,7 @@ wait;
 statement ok
 set rw_implicit_flush to true;
 
-sleep 3s
+sleep 5s
 
 # UNCHANGED: rebuilding from the buffer table (not the now-absent frontier entry) still finds
 # partition 1's live rows and silently reseeds its emitted match -- nothing re-emitted, nothing lost.
@@ -178,7 +178,7 @@ select n, dip from mv_eou_idle_recover;
 statement ok
 insert into t_eou_idle_recover values (1, 13, -2);
 
-sleep 3s
+sleep 5s
 
 # EXACTLY ONCE: the revised row replaces the prior one via a proper Delete/Insert pair -- one row,
 # with the revised content. Had the rebuild enumerated via the (now-absent) frontier entry instead of

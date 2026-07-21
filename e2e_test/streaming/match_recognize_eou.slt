@@ -6,13 +6,16 @@
 # structural-death or WITHIN-expiry point, the match's rows are evicted and it is dropped from the
 # diff base WITHOUT a retraction (a finalized match is a permanent, already-emitted result).
 #
-# Three independent scenarios, each on its own table/MV:
+# Four independent scenarios, each on its own table/MV:
 #   1. lifecycle: provisional -> revised (greedy extension) -> finalized (watermark past deadline).
 #   2. cascade: a late out-of-order row re-partitions two overlapping matches under SKIP TO NEXT ROW,
 #      revising one match's content while introducing a brand-new one.
 #   3. I2 regression: a match's rows arrive AND become watermark-safe-and-evicted within a SINGLE
 #      barrier, with no earlier barrier ever having diffed the partition. The watermark path must
 #      emit the whole-buffer diff before eviction, or the match is silently lost.
+#   4. finalization straddle under SKIP TO NEXT ROW: the watermark-driven eviction boundary lands
+#      strictly inside a frozen overlapping match's span; the executor must drop-and-rebuild the
+#      matcher (never rebase across the straddle) and both matches survive, unretracted.
 #
 # Self-cleaning: guard re-runs with `drop ... if exists` up front, since a failing assertion aborts
 # before that block's own drops.
@@ -37,6 +40,12 @@ drop materialized view if exists mv_eou_i2;
 
 statement ok
 drop table if exists t_eou_i2;
+
+statement ok
+drop materialized view if exists mv_eou_straddle;
+
+statement ok
+drop table if exists t_eou_straddle;
 
 # ---------------------------------------------------------------------------------------------
 # Scenario 1: lifecycle -- provisional, revised, finalized.
@@ -207,3 +216,87 @@ drop materialized view mv_eou_i2;
 
 statement ok
 drop table t_eou_i2;
+
+# ---------------------------------------------------------------------------------------------
+# Scenario 4: finalization straddle under SKIP TO NEXT ROW -- the eviction boundary lands INSIDE a
+# frozen overlapping match's span. pattern (a a) over three consecutive qualifying rows yields the
+# overlapping matches (r1,r2) and (r2,r3); once the watermark passes all three, (r1,r2) is complete
+# and evictable while (r2,r3) ends at the safe boundary and is held alive, so the eviction boundary
+# is r2 -- strictly inside the frozen (r1,r2). The executor must drop-and-rebuild the matcher rather
+# than rebase it across that straddled boundary (finalize_before_seq's no-straddle contract). Pins:
+# both matches are emitted, finalization retracts neither (stable rows, exact count), and the
+# partition keeps working after the straddle-shaped eviction (no panic, no corrupted bookkeeping,
+# no duplicate emission from the rebuilt matcher).
+# ---------------------------------------------------------------------------------------------
+
+statement ok
+create table t_eou_straddle (id int, ts int, v int, watermark for ts as ts - 10) append only;
+
+statement ok
+create materialized view mv_eou_straddle as
+select * from t_eou_straddle match_recognize (
+  partition by id
+  order by ts
+  measures first(a.ts) as first_ts, last(a.ts) as last_ts
+  one row per match
+  after match skip to next row
+  pattern (a a)
+  define a as a.v > 0
+);
+
+# Three consecutive qualifying rows: the whole-buffer diff at this barrier emits both overlapping
+# matches.
+statement ok
+insert into t_eou_straddle values (1, 1, 5), (1, 2, 6), (1, 3, 7);
+
+statement ok
+flush;
+
+query II rowsort
+select first_ts, last_ts from mv_eou_straddle;
+----
+1 2
+2 3
+
+# The sentinel (id 2, ts 14) advances the watermark to 4 -- past all three rows. The eviction
+# boundary is ts=2 (the held (2,3) match's start, the first live position), strictly inside the
+# frozen (1,2): the straddle shape. The executor drops the matcher, evicts the ts=1 row, and prunes
+# (1,2) from the diff base WITHOUT a retraction -- both rows must remain, byte-identical.
+statement ok
+insert into t_eou_straddle values (2, 14, 0);
+
+statement ok
+flush;
+
+query II rowsort
+select first_ts, last_ts from mv_eou_straddle;
+----
+1 2
+2 3
+
+query I
+select count(*) from mv_eou_straddle;
+----
+2
+
+# A later row (ts=10, above the watermark) extends the partition: the rebuilt matcher (dropped at
+# the straddle eviction) re-derives the surviving (2,3) unchanged -- no duplicate Insert against the
+# `_match_id` the MV already holds -- and finds the brand-new (3,10) overlapping match.
+statement ok
+insert into t_eou_straddle values (1, 10, 9);
+
+statement ok
+flush;
+
+query II rowsort
+select first_ts, last_ts from mv_eou_straddle;
+----
+1 2
+2 3
+3 10
+
+statement ok
+drop materialized view mv_eou_straddle;
+
+statement ok
+drop table t_eou_straddle;

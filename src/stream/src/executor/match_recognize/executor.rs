@@ -54,8 +54,9 @@
 //! variable labels are found. Each measure is an expression over a synthetic row whose columns are
 //! produced by its [`MeasureSlot`]s from the matched rows.
 //!
-//! State: the buffered rows (the raw input row plus its satisfied pattern variables) are persisted
-//! to a state table — written through on arrival, deleted on consumption — and restored on recovery.
+//! State: only the raw buffered rows are persisted to a state table (row layout `[seq, input
+//! columns...]`; satisfied pattern variables are re-derived by matching on scan, never stored) —
+//! written through on arrival, deleted on consumption — and restored on recovery.
 //!
 //! Emission modes (the `emit_on_update` flag, set by the planner): under EMIT ON WINDOW CLOSE
 //! (`emit_on_update = false`) emission is *final-only* — the completed match above is emitted as an
@@ -525,6 +526,8 @@ impl CandidateMatcher for DefineMatcher<'_> {
 
 /// Align a partition's [`IncrementalMatcher`] with the freshly-scanned safe prefix `rows[0..safe_len]`
 /// (PK-ordered, so the fed rows should be a leading run of it) before its `provisional()` is read.
+/// On return, `provisional()` equals a from-scratch `find_matches_dynamic(safe_len, matcher, skip)`
+/// over `rows[0..safe_len]` — in every case below, not just the append path.
 ///
 /// The common case is a plain append: the safe rows already fed are a prefix of `rows`, so the tail
 /// `rows[fed_len..safe_len]` is fed via [`IncrementalMatcher::advance`]. If a safe row arrived
@@ -533,6 +536,14 @@ impl CandidateMatcher for DefineMatcher<'_> {
 /// at the first displaced fed row's seq (the resync point), then the corrected sorted suffix from the
 /// divergence is re-fed. `matcher` is this visit's `DefineMatcher`; it resolves absolute positions
 /// into `rows`, so the matcher's positions stay aligned with the buffer.
+///
+/// The third case is an over-feed rollback: more rows were fed than this visit's window (under
+/// emit-on-update the barrier/emit-before-finalize paths feed the *whole* buffer, and the watermark
+/// eviction pass then narrows back to the safe prefix). The truncation rolls the over-fed tail back,
+/// but it also drops the provisional matches over the retained fed suffix `[next_pos, safe_len)` —
+/// and with nothing left to re-feed (`advance` would be a no-op), those matches must be re-derived
+/// in place via [`IncrementalMatcher::rescan`], or `provisional()` would silently under-report the
+/// mutable suffix until the next feed.
 async fn refresh_matcher(
     inc: &mut IncrementalMatcher,
     rows: &[BufferedRow],
@@ -547,7 +558,8 @@ async fn refresh_matcher(
             i += 1;
         }
         // A divergence with fed rows still remaining means a safe row sorts before an already-fed
-        // one: `fed[i]` is the first fed row whose sorted position shifted (the resync seq).
+        // one (or, at `i == safe_len`, that the matcher was over-fed past this window): `fed[i]` is
+        // the first fed row whose sorted position shifted (the resync seq).
         let resync = (i < fed.len()).then(|| fed[i]);
         (i, resync)
     };
@@ -555,9 +567,15 @@ async fn refresh_matcher(
         inc.truncate_from_seq(resync, matcher).await?;
     }
     // Feed the (corrected) sorted suffix from the divergence point. Empty in the steady state where
-    // nothing new became safe; a no-op `advance` then.
+    // nothing new became safe (a no-op `advance` then) — and in the over-feed rollback, where the
+    // retained rows are still fed and only their truncation-dropped provisional matches need
+    // re-deriving: rescan in place instead.
     let new_seqs: Vec<i64> = rows[diverge_at..safe_len].iter().map(|r| r.seq).collect();
-    inc.advance(&new_seqs, matcher).await?;
+    if new_seqs.is_empty() && resync.is_some() {
+        inc.rescan(matcher).await?;
+    } else {
+        inc.advance(&new_seqs, matcher).await?;
+    }
     Ok(())
 }
 
@@ -749,50 +767,59 @@ async fn rebuild_last_emitted<S: StateStore>(
             .await?;
         pin_mut!(iter);
         // Current group: one partition's key and its buffered rows (in PK order, i.e. ORDER BY
-        // order), seeded into `last_emitted` when the key changes or the vnode's scan ends.
+        // order), seeded into `last_emitted` when the key changes or the vnode's scan ends. The
+        // loop runs one extra iteration with no next row, so the end-of-scan flush shares the
+        // partition-boundary flush below.
         let mut cur: Option<(OwnedRow, Vec<BufferedRow>)> = None;
-        while let Some(item) = iter.next().await {
+        loop {
             // Stored row layout: `[ seq, <input cols..> ]` (same parse as the watermark/barrier
             // scans); the partition key is projected from the input columns, exactly as at ingest.
-            let row = item?.into_owned_row();
-            let seq = row.datum_at(0).expect("seq not null").into_int64();
-            let input_row = OwnedRow::new(
-                (1..1 + input_arity)
-                    .map(|i| row.datum_at(i).to_owned_datum())
-                    .collect(),
-            );
-            let partition_key = (&input_row).project(partition_key_indices).into_owned_row();
-            let order_key = input_row.datum_at(time_col).to_owned_datum();
-            let brow = BufferedRow {
-                seq,
-                order_key,
-                row: input_row,
+            let next = match iter.next().await.transpose()? {
+                Some(row) => {
+                    let row = row.into_owned_row();
+                    let seq = row.datum_at(0).expect("seq not null").into_int64();
+                    let input_row = OwnedRow::new(
+                        (1..1 + input_arity)
+                            .map(|i| row.datum_at(i).to_owned_datum())
+                            .collect(),
+                    );
+                    let partition_key =
+                        (&input_row).project(partition_key_indices).into_owned_row();
+                    let order_key = input_row.datum_at(time_col).to_owned_datum();
+                    let brow = BufferedRow {
+                        seq,
+                        order_key,
+                        row: input_row,
+                    };
+                    Some((partition_key, brow))
+                }
+                None => None,
             };
-            match &mut cur {
-                Some((k, rows)) if *k == partition_key => rows.push(brow),
-                _ => {
-                    // Partition boundary: seed the finished group, then start the new one.
-                    if let Some((k, rows)) = cur.take() {
+            match (&mut cur, next) {
+                (Some((k, rows)), Some((pk, brow))) if *k == pk => rows.push(brow),
+                (slot, next) => {
+                    // Partition boundary (or end of the vnode's scan): seed the finished group,
+                    // then start the new one (or stop).
+                    if let Some((k, rows)) = slot.take() {
                         let inc = matchers
                             .entry(k.clone())
                             .or_insert_with(|| IncrementalMatcher::new(nfa, skip.clone()));
                         let new_emitted =
                             compute_partition_emitted(inc, &k, &rows, defines, within, measures)
                                 .await?;
-                        last_emitted.insert(k, new_emitted);
+                        // A partition with no provisional matches diffs identically against an
+                        // absent base entry and an empty one, so skip the empty entry and keep the
+                        // base populated only for partitions that actually emitted something.
+                        if !new_emitted.is_empty() {
+                            last_emitted.insert(k, new_emitted);
+                        }
                     }
-                    cur = Some((partition_key, vec![brow]));
+                    match next {
+                        Some((pk, brow)) => *slot = Some((pk, vec![brow])),
+                        None => break,
+                    }
                 }
             }
-        }
-        // Seed the vnode's last group.
-        if let Some((k, rows)) = cur.take() {
-            let inc = matchers
-                .entry(k.clone())
-                .or_insert_with(|| IncrementalMatcher::new(nfa, skip.clone()));
-            let new_emitted =
-                compute_partition_emitted(inc, &k, &rows, defines, within, measures).await?;
-            last_emitted.insert(k, new_emitted);
         }
     }
     Ok(())
@@ -828,8 +855,9 @@ pub struct MatchRecognizeExecutorArgs<S: StateStore> {
     /// Wakeup frontier: `pk (next_wakeup_order_key, partition...)`, distributed by partition.
     pub frontier_index_table: StateTable<S>,
     /// Emit-On-Update mode (the plain form, without `EMIT ON WINDOW CLOSE`): the planner has
-    /// already committed to this node emitting a retract stream. Stored for a later change to wire
-    /// the actual emission behavior; not yet read anywhere.
+    /// already committed to this node emitting a retract stream, and the executor delivers it —
+    /// a provisional-match changelog diffed at each barrier over the whole buffer, with the
+    /// watermark doing finalization only. See the executor field of the same name for details.
     pub emit_on_update: bool,
 }
 
@@ -1432,9 +1460,11 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             };
                             // Drive matching through this partition's incremental matcher instead of
                             // rescanning the whole safe prefix. Feed the newly-safe rows (resyncing on
-                            // out-of-order arrival) and read `provisional()`, which by construction
-                            // equals `find_matches_dynamic(safe_len, &matcher, &skip)` — so every
-                            // downstream emit/evict decision below is unchanged.
+                            // out-of-order arrival, and rolling back + rescanning after an
+                            // emit-on-update whole-buffer feed) and read `provisional()`, which
+                            // `refresh_matcher` guarantees equals `find_matches_dynamic(safe_len,
+                            // &matcher, &skip)` — so every downstream emit/evict decision below is
+                            // unchanged.
                             let inc = matchers
                                 .entry(partition_key.clone())
                                 .or_insert_with(|| IncrementalMatcher::new(&nfa, skip.clone()));
@@ -1612,27 +1642,45 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
 
                             // Keep the matcher aligned with the post-eviction buffer. The evicted rows
                             // are `rows[0..retain_from]`; the surviving front becomes `rows[retain_from]`.
-                            // `finalize_before_seq` rebases the matcher to that row, but only when the
-                            // evicted prefix lies within the frozen region (`retain_from <= frozen
-                            // prefix len`) and that row was actually fed (`retain_from < safe_len`).
-                            // Otherwise — the whole buffer drained, only unsafe (never-fed) rows
-                            // survive, or eviction reached past the frozen boundary (a trailing dead
-                            // gap, or a WITHIN-expired but structurally-live partial) — the matcher
-                            // cannot rebase there, so drop it and let the next visit rebuild lazily
-                            // from the scanned buffer. Both paths keep `provisional()` equal to a
-                            // from-scratch scan of the surviving buffer on the next visit.
+                            //
+                            // `finalize_before_seq` rebases the matcher to that row, but ONLY under
+                            // `PAST LAST ROW`, where the rebase boundary is provably straddle-free:
+                            // `resume == end`, so the freeze regions tile `[0, frozen_prefix_len())`
+                            // completely with liveness-checked-dead positions and every frozen
+                            // match's span ends at or before that prefix; the eviction scan picks the
+                            // first *alive* position, so when the guard below holds, `retain_from`
+                            // equals the frozen prefix length exactly and every frozen match ends at
+                            // or before it — none straddles.
+                            //
+                            // Under the overlapping skip modes (`TO NEXT ROW` / `TO FIRST` / `TO
+                            // LAST`) the resume point precedes the match end, so a FROZEN match's
+                            // span can extend past the frozen prefix and the same guard does NOT
+                            // imply no-straddle: `pattern (a a) after match skip to next row` over
+                            // three qualifying rows freezes (0,2) with a frozen prefix of 1 while
+                            // (1,3) is boundary-held, and eviction picks `retain_from == 1` — inside
+                            // the frozen span, violating `finalize_before_seq`'s no-straddle contract
+                            // (debug panic; corrupted rebasing in release). Those modes therefore
+                            // always drop and rebuild. (Teaching `finalize_before_seq` to drop
+                            // consumed straddling frozen matches would let the overlapping modes
+                            // rebase too — a follow-up optimization, not a correctness need.)
+                            //
+                            // The other two conditions guard shapes where even `PAST LAST ROW` cannot
+                            // rebase: the boundary row must have been fed (`retain_from < safe_len`)
+                            // and lie within the frozen prefix — otherwise the whole buffer drained,
+                            // only unsafe (never-fed) rows survive, or eviction reached past the
+                            // frozen boundary (a trailing dead gap, or a WITHIN-expired but
+                            // structurally-live partial). All drop paths let the next visit rebuild
+                            // lazily from the scanned buffer, keeping `provisional()` equal to a
+                            // from-scratch scan of the surviving buffer.
                             if retain_from > 0 {
-                                if retain_from < safe_len
-                                    && retain_from
-                                        <= matchers
-                                            .get(&partition_key)
-                                            .expect("matcher inserted above")
-                                            .frozen_prefix_len()
+                                let inc = matchers
+                                    .get_mut(&partition_key)
+                                    .expect("matcher inserted above");
+                                if skip == SkipMode::PastLastRow
+                                    && retain_from < safe_len
+                                    && retain_from <= inc.frozen_prefix_len()
                                 {
-                                    matchers
-                                        .get_mut(&partition_key)
-                                        .expect("matcher inserted above")
-                                        .finalize_before_seq(rows[retain_from].seq);
+                                    inc.finalize_before_seq(rows[retain_from].seq);
                                 } else {
                                     matchers.remove(&partition_key);
                                 }

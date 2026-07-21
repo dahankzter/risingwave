@@ -44,3 +44,57 @@ drop materialized view mv_skip;
 
 statement ok
 drop table t;
+
+# Finalization straddle under SKIP TO NEXT ROW (overlapping matches): pattern (a a) over three
+# consecutive qualifying rows yields the overlapping matches (r1,r2) and (r2,r3). Once the watermark
+# passes all three, (r1,r2) is complete and evictable while (r2,r3) ends at the safe boundary and is
+# held (it could still be the prefix of nothing — but its start stays alive), so the eviction
+# boundary is r2 — strictly INSIDE the already-frozen (r1,r2)'s span. The executor must not rebase
+# the incremental matcher across a straddled boundary (finalize_before_seq's no-straddle contract);
+# it drops and rebuilds instead. Pins: the eviction survives (no panic, no corrupted matcher
+# bookkeeping), the first match is emitted at the first watermark, and the held match is emitted —
+# exactly once — when a later non-matching row closes it.
+
+statement ok
+create table t_skip_straddle (id int, ts int, v int, watermark for ts as ts - 10) append only;
+
+statement ok
+create materialized view mv_skip_straddle as
+select * from t_skip_straddle match_recognize (
+  partition by id
+  order by ts
+  measures first(a.ts) as first_ts, last(a.ts) as last_ts
+  one row per match
+  after match skip to next row
+  pattern (a a)
+  define a as a.v > 0
+)
+emit on window close;
+
+# Three qualifying rows; the sentinel (id 0, ts 13) advances the watermark to 3, exactly past them,
+# so the straddle-shaped eviction runs: (1,2) finalizes and emits, (2,3) is boundary-held.
+statement ok
+insert into t_skip_straddle values (1, 1, 5), (1, 2, 6), (1, 3, 7), (0, 13, 0);
+
+query II rowsort
+select first_ts, last_ts from mv_skip_straddle;
+----
+1 2
+
+# A non-matching row (v = -1) closes the held (2,3) match strictly before the new safe boundary; the
+# rebuilt matcher (dropped at the straddle eviction above) must emit it exactly once and keep the
+# partition working — proving the finalization survived with intact bookkeeping.
+statement ok
+insert into t_skip_straddle values (1, 4, -1), (0, 24, 0);
+
+query II rowsort
+select first_ts, last_ts from mv_skip_straddle;
+----
+1 2
+2 3
+
+statement ok
+drop materialized view mv_skip_straddle;
+
+statement ok
+drop table t_skip_straddle;
