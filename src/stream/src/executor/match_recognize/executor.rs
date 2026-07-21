@@ -108,7 +108,9 @@ use risingwave_pb::stream_plan::{
 use risingwave_storage::StateStore;
 use risingwave_storage::store::PrefetchOptions;
 
-use super::incremental::{IncrementalMatcher, SeqMatch, diff_provisional, plan_provisional_rows};
+use super::incremental::{
+    Finalized, IncrementalMatcher, Seq, SeqMatch, diff_provisional, plan_provisional_rows,
+};
 use super::nfa::{CandidateMatcher, LabeledMatch, Nfa, SkipDegradation, SkipMode};
 use crate::common::table::state_table::StateTable;
 use crate::executor::prelude::*;
@@ -570,7 +572,7 @@ async fn refresh_matcher(
     // nothing new became safe (a no-op `advance` then) — and in the over-feed rollback, where the
     // retained rows are still fed and only their truncation-dropped provisional matches need
     // re-deriving: rescan in place instead.
-    let new_seqs: Vec<i64> = rows[diverge_at..safe_len].iter().map(|r| r.seq).collect();
+    let new_seqs: Vec<Seq> = rows[diverge_at..safe_len].iter().map(|r| r.seq).collect();
     if new_seqs.is_empty() && resync.is_some() {
         inc.rescan(matcher).await?;
     } else {
@@ -615,7 +617,8 @@ async fn build_match_row(
     let measures_row = OwnedRow::new(measure_datums);
     Ok(partition_key
         .chain(&measures_row)
-        .chain(once(Some(ScalarImpl::Int64(match_id))))
+        // Unwrap the seq newtype to its raw `i64` here, where the output `_match_id` datum is built.
+        .chain(once(Some(ScalarImpl::Int64(match_id.0))))
         .into_owned_row())
 }
 
@@ -631,7 +634,7 @@ async fn refresh_partition_matcher(
     rows: &[BufferedRow],
     defines: &HashMap<String, CompiledDefine>,
     within: Option<&NonStrictExpression>,
-) -> StreamExecutorResult<HashMap<i64, usize>> {
+) -> StreamExecutorResult<HashMap<Seq, usize>> {
     let safe_len = rows.len();
     let matcher = DefineMatcher {
         rows,
@@ -640,7 +643,7 @@ async fn refresh_partition_matcher(
         within,
     };
     refresh_matcher(inc, rows, safe_len, &matcher).await?;
-    let mut seq_to_pos: HashMap<i64, usize> = HashMap::with_capacity(safe_len);
+    let mut seq_to_pos: HashMap<Seq, usize> = HashMap::with_capacity(safe_len);
     for (p, r) in rows.iter().enumerate() {
         seq_to_pos.insert(r.seq, p);
     }
@@ -728,7 +731,16 @@ async fn emit_partition_diff(
     // Ops in `diff_provisional`'s order (start-seq ascending, Delete-before-Insert per revision); the
     // base then advances to the new set.
     let ops = diff_provisional(prev, &new_emitted);
-    last_emitted.insert(partition_key.clone(), new_emitted);
+    // Advance the base. An empty set diffs identically against an absent entry and an empty one (both
+    // are `&[]`), so drop the key rather than keep an empty vec (mirrors `rebuild_last_emitted`).
+    // When the key already exists (the steady state), overwrite in place to avoid cloning it.
+    if new_emitted.is_empty() {
+        last_emitted.remove(partition_key);
+    } else if let Some(slot) = last_emitted.get_mut(partition_key) {
+        *slot = new_emitted;
+    } else {
+        last_emitted.insert(partition_key.clone(), new_emitted);
+    }
     Ok(ops)
 }
 
@@ -797,7 +809,7 @@ async fn rebuild_last_emitted<S: StateStore>(
             let next = match iter.next().await.transpose()? {
                 Some(row) => {
                     let row = row.into_owned_row();
-                    let seq = row.datum_at(0).expect("seq not null").into_int64();
+                    let seq = Seq(row.datum_at(0).expect("seq not null").into_int64());
                     let input_row = OwnedRow::new(
                         (1..1 + input_arity)
                             .map(|i| row.datum_at(i).to_owned_datum())
@@ -919,8 +931,9 @@ pub struct MatchRecognizeExecutor<S: StateStore> {
 /// A buffered input row, materialized from the state table while processing one partition.
 struct BufferedRow {
     /// Per-actor monotonic id; the state-table key tiebreaker (keeps rows with equal ORDER BY keys
-    /// distinct and stably ordered).
-    seq: i64,
+    /// distinct and stably ordered). The raw `i64` is read from / written to the state table at the
+    /// storage boundary and unwrapped (`.0`) only where the `_match_id` output datum is built.
+    seq: Seq,
     /// Leading ORDER BY value (a copy of `row[time_col]`), compared against the watermark to find
     /// the safe prefix. The buffer arrives pre-sorted by the full ORDER BY key (state-table PK).
     order_key: Datum,
@@ -1376,7 +1389,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 pin_mut!(iter);
                                 while let Some(item) = iter.next().await {
                                     let row = item?.into_owned_row();
-                                    let seq = row.datum_at(0).expect("seq not null").into_int64();
+                                    let seq = Seq(row.datum_at(0).expect("seq not null").into_int64());
                                     let input_row = OwnedRow::new(
                                         (1..1 + input_arity)
                                             .map(|i| row.datum_at(i).to_owned_datum())
@@ -1503,7 +1516,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             // Map seq-anchored provisional matches back to buffer positions. A match
                             // spans contiguous positions, so `end = start + labels.len()`, exactly as
                             // `find_matches_dynamic` reports it.
-                            let mut seq_to_pos: HashMap<i64, usize> =
+                            let mut seq_to_pos: HashMap<Seq, usize> =
                                 HashMap::with_capacity(safe_len);
                             for (p, r) in rows[..safe_len].iter().enumerate() {
                                 seq_to_pos.insert(r.seq, p);
@@ -1668,51 +1681,33 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             // row (`delete` takes `impl Row`), so no owned copy is built per evictee.
                             for c in &rows[0..retain_from] {
                                 state_table
-                                    .delete(once(Some(ScalarImpl::Int64(c.seq))).chain(&c.row));
+                                    .delete(once(Some(ScalarImpl::Int64(c.seq.0))).chain(&c.row));
                             }
 
                             // Keep the matcher aligned with the post-eviction buffer. The evicted rows
                             // are `rows[0..retain_from]`; the surviving front becomes `rows[retain_from]`.
-                            //
-                            // `finalize_before_seq` rebases the matcher to that row, but ONLY under
-                            // `PAST LAST ROW`, where the rebase boundary is provably straddle-free:
-                            // `resume == end`, so the freeze regions tile `[0, frozen_prefix_len())`
-                            // completely with liveness-checked-dead positions and every frozen
-                            // match's span ends at or before that prefix; the eviction scan picks the
-                            // first *alive* position, so when the guard below holds, `retain_from`
-                            // equals the frozen prefix length exactly and every frozen match ends at
-                            // or before it — none straddles.
-                            //
-                            // Under the overlapping skip modes (`TO NEXT ROW` / `TO FIRST` / `TO
-                            // LAST`) the resume point precedes the match end, so a FROZEN match's
-                            // span can extend past the frozen prefix and the same guard does NOT
-                            // imply no-straddle: `pattern (a a) after match skip to next row` over
-                            // three qualifying rows freezes (0,2) with a frozen prefix of 1 while
-                            // (1,3) is boundary-held, and eviction picks `retain_from == 1` — inside
-                            // the frozen span, violating `finalize_before_seq`'s no-straddle contract
-                            // (debug panic; corrupted rebasing in release). Those modes therefore
-                            // always drop and rebuild. (Teaching `finalize_before_seq` to drop
-                            // consumed straddling frozen matches would let the overlapping modes
-                            // rebase too — a follow-up optimization, not a correctness need.)
-                            //
-                            // The other two conditions guard shapes where even `PAST LAST ROW` cannot
-                            // rebase: the boundary row must have been fed (`retain_from < safe_len`)
-                            // and lie within the frozen prefix — otherwise the whole buffer drained,
-                            // only unsafe (never-fed) rows survive, or eviction reached past the
-                            // frozen boundary (a trailing dead gap, or a WITHIN-expired but
-                            // structurally-live partial). All drop paths let the next visit rebuild
-                            // lazily from the scanned buffer, keeping `provisional()` equal to a
-                            // from-scratch scan of the surviving buffer.
+                            // The matcher owns the finalize-vs-rebuild decision: given the first
+                            // surviving row's seq as the eviction boundary, `finalize_evicted_prefix`
+                            // rebases in place when it soundly can (PAST LAST ROW, boundary fed and
+                            // within the frozen prefix, no straddle) and otherwise returns
+                            // `MustRebuild` — so no gate here can trip a debug assertion or underflow.
+                            // The executor only handles the whole-buffer-drained case (`retain_from ==
+                            // rows.len()`), where there is no surviving boundary row to rebase onto.
+                            // Every drop path lets the next visit rebuild lazily from the scanned
+                            // buffer, keeping `provisional()` equal to a from-scratch scan.
                             if retain_from > 0 {
-                                let inc = matchers
-                                    .get_mut(&partition_key)
-                                    .expect("matcher inserted above");
-                                if skip == SkipMode::PastLastRow
-                                    && retain_from < safe_len
-                                    && retain_from <= inc.frozen_prefix_len()
-                                {
-                                    inc.finalize_before_seq(rows[retain_from].seq);
+                                let must_rebuild = if retain_from < rows.len() {
+                                    let inc = matchers
+                                        .get_mut(&partition_key)
+                                        .expect("matcher inserted above");
+                                    matches!(
+                                        inc.finalize_evicted_prefix(rows[retain_from].seq),
+                                        Finalized::MustRebuild
+                                    )
                                 } else {
+                                    true
+                                };
+                                if must_rebuild {
                                     matchers.remove(&partition_key);
                                 }
                             }
@@ -1724,7 +1719,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                             // — so drop it from the diff base *without* emitting a retract. Matches
                             // whose start survives stay in the base and are re-diffed at the next
                             // barrier. Keying on the surviving seqs covers both the
-                            // `finalize_before_seq` and matcher-drop paths above uniformly (a
+                            // `finalize_evicted_prefix` and matcher-drop paths above uniformly (a
                             // live/emitted match's start is never evicted, since
                             // `reaches_boundary_alive` keeps it).
                             //
@@ -1745,7 +1740,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 && retain_from > 0
                                 && last_emitted.contains_key(&partition_key)
                             {
-                                let surviving: HashSet<i64> =
+                                let surviving: HashSet<Seq> =
                                     rows[retain_from..].iter().map(|r| r.seq).collect();
                                 let prev = last_emitted
                                     .get_mut(&partition_key)
@@ -1881,7 +1876,7 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                                 pin_mut!(iter);
                                 while let Some(item) = iter.next().await {
                                     let row = item?.into_owned_row();
-                                    let seq = row.datum_at(0).expect("seq not null").into_int64();
+                                    let seq = Seq(row.datum_at(0).expect("seq not null").into_int64());
                                     let input_row = OwnedRow::new(
                                         (1..1 + input_arity)
                                             .map(|i| row.datum_at(i).to_owned_datum())
