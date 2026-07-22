@@ -97,6 +97,7 @@ use risingwave_common::array::{Op, StreamChunk};
 use risingwave_common::hash::VnodeBitmapExt;
 use risingwave_common::row::{OwnedRow, Row, RowExt, once};
 use risingwave_common::types::{DataType, Datum, DefaultOrd, ScalarImpl, ToOwnedDatum};
+use risingwave_common::util::iter_util::ZipEqFast;
 use risingwave_common::util::row_id::RowIdGenerator;
 use risingwave_expr::ExprError;
 use risingwave_expr::aggregate::{AggCall, BoxedAggregateFunction, build_append_only};
@@ -717,7 +718,10 @@ async fn emit_partition_diff(
         .unwrap_or(&[]);
     let plan = plan_provisional_rows(prev, provisional);
     let mut new_emitted: Vec<(SeqMatch, OwnedRow)> = Vec::with_capacity(provisional.len());
-    for (m, reuse) in provisional.iter().zip(plan) {
+    // `plan` is positional over `provisional` (one entry per provisional match, by construction of
+    // `plan_provisional_rows`), so the equal-length zip asserts that invariant instead of silently
+    // truncating if it were ever broken.
+    for (m, reuse) in provisional.iter().zip_eq_fast(plan) {
         let out_row = match reuse {
             Some(i) => prev[i].1.clone(),
             None => {
