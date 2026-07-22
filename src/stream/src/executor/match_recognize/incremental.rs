@@ -538,6 +538,8 @@ impl IncrementalMatcher {
 mod tests {
     use std::collections::BTreeSet;
 
+    use rand::rngs::SmallRng;
+    use rand::{Rng, SeedableRng};
     use risingwave_common::array::Op;
     use risingwave_common::row::OwnedRow;
     use risingwave_common::types::ScalarImpl;
@@ -1827,5 +1829,192 @@ mod tests {
             provisional_triples(&inc),
             batch_triples(&nfa, &skip, &full).await
         );
+    }
+
+    // ---- Randomized operation-sequence oracle (spec §8.1) ---------------------------------------
+    //
+    // The targeted tests above pin specific shapes; this property test closes the randomized-oracle
+    // gap by driving *arbitrary* interleavings of the matcher's operations against the batch
+    // reference. For each seed it draws a random pattern (over a small grammar), a random
+    // `AFTER MATCH SKIP` mode (all four), random satisfied-set rows, and a random op sequence
+    // (`advance` in in-order chunks incl. empty, `truncate_from_seq` at valid and never-fed seqs,
+    // `finalize_evicted_prefix` at executor-reachable boundaries). After *every* op it asserts the
+    // core invariant — `provisional()` (full `(start, end, labels)` triples) equals a from-scratch
+    // batch `find_matches_dynamic` over the currently-live rows for the same skip mode. Seeds are
+    // fixed (`0..N`), so CI is deterministic; everything is in-memory, so the sweep runs in seconds.
+
+    /// Build a random pattern over `vars`, shrinking toward a leaf as `budget` decreases so the
+    /// compiled NFA stays small (≤64 states → bitmask visited-set) and the batch rescans stay cheap.
+    fn gen_pattern(rng: &mut SmallRng, vars: &[&str], budget: usize) -> Pattern {
+        let pick_var = |rng: &mut SmallRng| Pattern::Var(vars[rng.random_range(0..vars.len())].into());
+        // Out of budget → leaf; otherwise choose a construct.
+        let choice = if budget == 0 { 0 } else { rng.random_range(0..4) };
+        match choice {
+            // Concatenation of 2–3 sub-patterns.
+            1 => Pattern::Concat(
+                (0..rng.random_range(2..=3))
+                    .map(|_| gen_pattern(rng, vars, budget - 1))
+                    .collect(),
+            ),
+            // Alternation of 2–3 sub-patterns.
+            2 => Pattern::Alt(
+                (0..rng.random_range(2..=3))
+                    .map(|_| gen_pattern(rng, vars, budget - 1))
+                    .collect(),
+            ),
+            // A quantified sub-pattern (greedy or reluctant), all four quantifier shapes.
+            3 => {
+                let inner = gen_pattern(rng, vars, budget - 1);
+                let q = match rng.random_range(0..4) {
+                    0 => Quantifier::Star,
+                    1 => Quantifier::Plus,
+                    2 => Quantifier::Question,
+                    _ => {
+                        let min = rng.random_range(0..=2);
+                        let max = rng
+                            .random_bool(0.5)
+                            .then(|| min + rng.random_range(0..=2));
+                        Quantifier::Range { min, max }
+                    }
+                };
+                Pattern::Quantified(Box::new(inner), q, rng.random_bool(0.5))
+            }
+            // Leaf variable.
+            _ => pick_var(rng),
+        }
+    }
+
+    /// A random `AFTER MATCH SKIP` mode; the variable-targeted modes bind a symbol from `vars` (a
+    /// valid symbol name — `next_pos` degrades to `PAST LAST ROW` if that symbol is absent from a
+    /// given match, which is itself a shape worth exercising).
+    fn gen_skip(rng: &mut SmallRng, vars: &[&str]) -> SkipMode {
+        match rng.random_range(0..4) {
+            0 => SkipMode::PastLastRow,
+            1 => SkipMode::ToNextRow,
+            2 => SkipMode::ToFirst(vars[rng.random_range(0..vars.len())].into()),
+            _ => SkipMode::ToLast(vars[rng.random_range(0..vars.len())].into()),
+        }
+    }
+
+    /// The core oracle assertion: the incremental matcher's provisional set equals a from-scratch
+    /// batch scan over the currently-live rows `full_rows[evicted..fed]`. Seqs equal original
+    /// positions, so a live match's seq-anchored triple is its batch (position-anchored) triple
+    /// shifted up by the evicted prefix length.
+    async fn assert_matches_batch(
+        inc: &IncrementalMatcher,
+        nfa: &Nfa,
+        skip: &SkipMode,
+        full_rows: &[BTreeSet<String>],
+        evicted: usize,
+        fed: usize,
+        ctx: &str,
+    ) {
+        let batch: Vec<(usize, usize, Vec<String>)> = batch_triples(nfa, skip, &full_rows[evicted..fed])
+            .await
+            .into_iter()
+            .map(|(s, e, ls)| (s + evicted, e + evicted, ls))
+            .collect();
+        assert_eq!(provisional_triples(inc), batch, "oracle divergence {ctx}");
+    }
+
+    #[tokio::test]
+    async fn randomized_operation_sequence_oracle() {
+        // ~200 seeds × ~30 ops. All in-memory over ≤7-row buffers, so the whole sweep is a few ms.
+        const SEEDS: u64 = 200;
+        const OPS: usize = 30;
+        let var_pool: [&[&str]; 3] = [&["a", "b"], &["a", "b", "c"], &["a", "b", "c", "d"]];
+
+        for seed in 0..SEEDS {
+            let mut rng = SmallRng::seed_from_u64(seed);
+            let vars = var_pool[rng.random_range(0..var_pool.len())];
+            let pattern = gen_pattern(&mut rng, vars, 3);
+            let nfa = Nfa::compile(&pattern);
+            let skip = gen_skip(&mut rng, vars);
+
+            // Random satisfied-set rows: each var present with prob ~0.6 (empty rows allowed).
+            let n_rows = rng.random_range(3..=7);
+            let full_rows: Vec<BTreeSet<String>> = (0..n_rows)
+                .map(|_| {
+                    vars.iter()
+                        .filter(|_| rng.random_bool(0.6))
+                        .map(|v| (*v).to_owned())
+                        .collect()
+                })
+                .collect();
+
+            let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
+            let mut fed = 0usize; // rows fed so far (== next seq to mint, since seq == position)
+            let mut evicted = 0usize; // rows finalized off the front of the live buffer
+
+            for op in 0..OPS {
+                // The candidate matcher over the currently-live rows (positions are 0-based from the
+                // evicted boundary, exactly as the executor's post-eviction buffer is).
+                let matcher = SetMatcher::new(full_rows[evicted..].to_vec());
+                let n_live = fed - evicted;
+                let ctx = format!("seed {seed} op {op}");
+
+                match rng.random_range(0..3) {
+                    // advance: feed the next in-order chunk (possibly empty).
+                    0 => {
+                        let remaining = full_rows.len() - fed;
+                        let chunk = if remaining == 0 {
+                            0
+                        } else {
+                            rng.random_range(0..=remaining.min(3))
+                        };
+                        let seqs: Vec<Seq> = (fed..fed + chunk).map(|i| Seq(i as i64)).collect();
+                        inc.advance(&seqs, &matcher).await.unwrap();
+                        fed += chunk;
+                    }
+                    // truncate + rescan: roll back at a random seq (valid fed, already-evicted, or
+                    // never-fed), then rescan to re-derive the retained tail in place — the executor's
+                    // out-of-order / over-feed rollback shape. A never-fed seq is a no-op.
+                    1 => {
+                        let lo = evicted.saturating_sub(1);
+                        let hi = fed + 2;
+                        let k = rng.random_range(lo..=hi);
+                        inc.truncate_from_seq(Seq(k as i64), &matcher).await.unwrap();
+                        if (evicted..fed).contains(&k) {
+                            fed = k; // rolled the live buffer back to the truncation point
+                        }
+                        inc.rescan(&matcher).await.unwrap();
+                    }
+                    // finalize: mirror the executor's eviction gate. Retain from the first row that is
+                    // still live at the safe boundary; evict the dead prefix before it. Only attempt
+                    // when there is a dead prefix and a surviving suffix (`0 < retain_from < n_live`).
+                    _ => {
+                        if n_live >= 2 {
+                            let mut retain_from = n_live;
+                            for p in 0..n_live {
+                                if nfa.reaches_boundary_alive(p, n_live, &matcher).await.unwrap() {
+                                    retain_from = p;
+                                    break;
+                                }
+                            }
+                            if retain_from > 0 && retain_from < n_live {
+                                let boundary = Seq((evicted + retain_from) as i64);
+                                match inc.finalize_evicted_prefix(boundary) {
+                                    Finalized::Rebased => evicted += retain_from,
+                                    // The executor drops the matcher and lets the next visit rebuild
+                                    // lazily; model that with a fresh matcher fed the surviving rows,
+                                    // then continue the sequence.
+                                    Finalized::MustRebuild => {
+                                        evicted += retain_from;
+                                        inc = IncrementalMatcher::new(&nfa, skip.clone());
+                                        let surv = SetMatcher::new(full_rows[evicted..].to_vec());
+                                        let seqs: Vec<Seq> =
+                                            (evicted..fed).map(|i| Seq(i as i64)).collect();
+                                        inc.advance(&seqs, &surv).await.unwrap();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Invariant after EVERY op.
+                assert_matches_batch(&inc, &nfa, &skip, &full_rows, evicted, fed, &ctx).await;
+            }
+        }
     }
 }
