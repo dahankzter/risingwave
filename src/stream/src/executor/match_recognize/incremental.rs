@@ -81,9 +81,11 @@ pub enum Finalized {
     /// surviving start seqs, uniformly across this and the drop-and-rebuild path, so a payload here
     /// would be an allocation nobody reads.
     Rebased,
-    /// The eviction cannot be rebased across — an overlapping skip mode, a boundary past the frozen
-    /// prefix or never fed, or a frozen match straddling the boundary — so the matcher was left
-    /// untouched and the caller must drop it and let the next visit rebuild from the surviving buffer.
+    /// The eviction cannot be rebased across — a boundary never fed, past the frozen prefix, or a
+    /// frozen match straddling the boundary strictly *inside* the frozen prefix (`final_pos <
+    /// next_pos`, reachable only via a direct API call, never the executor's eviction) — so the
+    /// matcher was left untouched and the caller must drop it and let the next visit rebuild from
+    /// the surviving buffer.
     MustRebuild,
 }
 
@@ -425,18 +427,30 @@ impl IncrementalMatcher {
     /// diffing `provisional()` before/after.
     ///
     /// This owns the finalize-vs-rebuild decision the executor used to make itself. It returns
-    /// [`Finalized::MustRebuild`] — leaving the matcher untouched — in every shape where an in-place
+    /// [`Finalized::MustRebuild`] — leaving the matcher untouched — in the shapes where an in-place
     /// rebase is unsound, so the executor never needs to pre-check (and no debug assertion can trip
     /// nor `next_pos -= final_pos` underflow):
-    /// - **Overlapping skip mode.** Only `PAST LAST ROW` has a provably straddle-free frozen prefix:
-    ///   its `resume == end`, so the freeze regions tile `[0, next_pos)` completely with
-    ///   liveness-checked-dead positions and every frozen match's span ends at or before the prefix.
-    ///   Under `TO NEXT ROW`/`TO FIRST`/`TO LAST` a resume precedes the match end, so a frozen span
-    ///   can extend past the prefix and the boundary can land inside it — not rebasable.
     /// - **Boundary never fed** (only unfed/unsafe rows survive) or **past the frozen prefix**
     ///   (`final_pos > next_pos`): finalization would reach into the open, still-revisable region.
-    /// - **A frozen match straddles the boundary** (starts before it, ends after): unreachable under
-    ///   `PAST LAST ROW` by the tiling above, but checked rather than asserted.
+    /// - **A frozen match straddles the boundary strictly inside the frozen prefix** — it starts
+    ///   before `final_pos` and ends after, while `final_pos < next_pos`. This arises only under the
+    ///   overlapping skip modes (`TO NEXT ROW`/`TO FIRST`/`TO LAST`), whose resume precedes the match
+    ///   end so a frozen span can outrun its own resume; see the consume/keep walk below for why it
+    ///   is declined. It is not reachable through the executor's eviction (which always lands the
+    ///   boundary at `final_pos == next_pos`, see below), only through a direct API call.
+    ///
+    /// **Why the overlapping skip modes now rebase** (they previously always rebuilt): the executor
+    /// evicts from the first row still live at the safe boundary. Every position in `[0, next_pos)`
+    /// was liveness-checked dead when its region froze, and deadness is monotone in the boundary, so
+    /// at the (same-or-later) eviction boundary `[0, next_pos)` is still dead and the first live row
+    /// is `>= next_pos`. The check above bounds `final_pos <= next_pos`, so through the executor
+    /// `final_pos == next_pos` exactly. At that boundary every frozen match starts before `next_pos`
+    /// and is therefore consumed — none is retained — so `next_pos` rebases to `0` and the entire
+    /// surviving suffix is re-derived from scratch as the provisional tail. `provisional()` then
+    /// trivially equals a fresh scan over the survivors, regardless of skip mode, and no rebased scan
+    /// cursor can skip a start a fresh matcher would find. `PAST LAST ROW` additionally tiles
+    /// `[0, next_pos)` with non-overlapping spans (`resume == end`), so *any* boundary within the
+    /// frozen prefix retains a suffix of frozen matches soundly.
     ///
     /// On [`Finalized::Rebased`] the evicted rows physically leave the front of the logical buffer:
     /// `seq_index` drains its prefix and `next_pos`/`frozen_count` shift down. Only rows at positions
@@ -445,10 +459,6 @@ impl IncrementalMatcher {
     /// argument (a frozen region is dead at its boundary) is preserved. Match spans are anchored by
     /// seq, so retained and returned [`SeqMatch`]es keep their identities without adjustment.
     pub fn finalize_evicted_prefix(&mut self, boundary: Seq) -> Finalized {
-        // Only PAST LAST ROW can be rebased across (see the doc); other modes always drop and rebuild.
-        if self.skip != SkipMode::PastLastRow {
-            return Finalized::MustRebuild;
-        }
         // Map the boundary seq to a fed position. Absent means the boundary row was never fed — the
         // whole fed prefix is being evicted and only unfed/unsafe rows survive — which cannot be
         // rebased against.
@@ -460,10 +470,13 @@ impl IncrementalMatcher {
             return Finalized::MustRebuild;
         }
 
-        // Finalized matches are a leading run of the frozen prefix: only frozen matches can end
-        // within `[0, next_pos)` (a provisional match starts at `>= next_pos`), and matches are
-        // stored in scan order. Walk them, recovering each start position from `seq_index` (seqs are
-        // identities, not positions), and stop at the first match that ends past the boundary.
+        // Finalized matches are the leading run of frozen matches whose *start* is being evicted
+        // (`start_pos < final_pos`): their first row leaves the buffer, so they are consumed — final,
+        // already emitted — and drop from the diffable set. Only frozen matches can start within
+        // `[0, next_pos)` (a provisional match starts at `>= next_pos`) and they are stored in scan
+        // order, so this is a single leading run; stop at the first match that starts at/after the
+        // boundary (it survives). Recover each start position from `seq_index` (seqs are identities,
+        // not positions).
         let mut finalized = 0usize;
         let mut cursor = 0usize;
         for m in &self.matched[..self.frozen_count] {
@@ -472,18 +485,24 @@ impl IncrementalMatcher {
                     .iter()
                     .position(|&s| s == m.start_seq)
                     .expect("finalized match start seq must still be fed");
-            let end_pos = start_pos + m.labels.len();
-            if end_pos <= final_pos {
-                finalized += 1;
-                // Later matches start strictly after this one (`resume > start`), so search forward.
-                cursor = start_pos + 1;
-            } else if start_pos >= final_pos {
+            if start_pos >= final_pos {
+                // Starts at/after the boundary: wholly retained (and so is everything after it).
                 break;
-            } else {
-                // Straddles the boundary — unreachable under PAST LAST ROW, but decline rather than
-                // corrupt the rebase.
+            }
+            let end_pos = start_pos + m.labels.len();
+            // A consumed match whose span straddles the boundary (`end_pos > final_pos`, possible
+            // only under the overlapping modes) orphans its surviving rows `[final_pos, end_pos)`.
+            // Dropping it is sound only when the boundary sits exactly at the scan cursor
+            // (`final_pos == next_pos`): then no frozen match is retained, so the whole surviving
+            // suffix is re-scanned from scratch and `provisional()` still equals a fresh scan. That
+            // is the only boundary the executor produces; decline a mid-frozen straddle (a direct-API
+            // shape) rather than corrupt the rebase by skipping a start a fresh scan would revisit.
+            if end_pos > final_pos && final_pos != self.next_pos {
                 return Finalized::MustRebuild;
             }
+            finalized += 1;
+            // Later matches start strictly after this one (`resume > start`), so search forward.
+            cursor = start_pos + 1;
         }
 
         // Drop the finalized matches and rebase the buffer.
@@ -1687,25 +1706,25 @@ mod tests {
         assert_eq!(ops, vec![(Op::Delete, orow(2)), (Op::Insert, orow(2))]);
     }
 
-    /// Why the executor must NOT rebase a finalization under the overlapping skip modes: with
-    /// `SKIP TO NEXT ROW` the resume point precedes the match end (`resume == start + 1 < end`), so
-    /// a FROZEN match's span can extend past the frozen prefix (`frozen_prefix_len()` is the resume
-    /// point, not the span end). `pattern (a a)` over three qualifying rows: (0,2) freezes with a
-    /// frozen prefix of 1 — position 0 is dead (the pattern is exactly two rows), but positions 1..2
-    /// were never liveness-checked — while (1,3) ends at the boundary and stays alive. The
-    /// executor's eviction boundary is the first alive position (1, exactly the frozen prefix), and
-    /// the frozen (0,2) straddles it. `finalize_evicted_prefix` returns `MustRebuild` for this shape
-    /// — here via its skip-mode guard, which subsumes the straddle risk wholesale for the overlapping
-    /// modes — so the executor drops and rebuilds instead of corrupting the rebase (see the eviction
-    /// arm in `executor.rs`, and the positive drop-and-rebuild test below).
+    /// The overlapping skip modes now rebase across a consumed straddling match instead of forcing a
+    /// rebuild. With `SKIP TO NEXT ROW` the resume point precedes the match end (`resume == start + 1
+    /// < end`), so a FROZEN match's span can extend past the frozen prefix. `pattern (a a)` over
+    /// three qualifying rows: (0,2) freezes with a frozen prefix of 1 — position 0 is dead (the
+    /// pattern is exactly two rows) — while (1,3) ends at the boundary and stays alive. The
+    /// executor's eviction boundary is the first alive position (1, exactly the frozen prefix
+    /// `next_pos`), and the frozen (0,2) straddles it: its start row (seq 0) is evicted, so (0,2) is
+    /// consumed (final, already emitted) and dropped. Because the boundary sits at `next_pos`, no
+    /// frozen match survives and `next_pos` rebases to 0, so the surviving suffix is re-derived from
+    /// scratch — `provisional()` then equals a fresh scan over the survivors (checked here).
     #[tokio::test]
-    async fn finalize_under_to_next_row_must_rebuild() {
+    async fn finalize_under_to_next_row_rebases_consuming_straddler() {
         let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("a".into())]);
         let nfa = Nfa::compile(&pat);
+        let skip = SkipMode::ToNextRow;
         let rows = from_str("aaa");
         let matcher = SetMatcher::new(rows.clone());
 
-        let mut inc = IncrementalMatcher::new(&nfa, SkipMode::ToNextRow);
+        let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
         inc.advance(&ss(&[0, 1, 2]), &matcher).await.unwrap();
         // Overlapping matches (0,2) and (1,3); only (0,2) froze, and the frozen prefix (its resume
         // point, 1) sits strictly inside its span [0, 2).
@@ -1715,25 +1734,36 @@ mod tests {
         );
         assert_eq!(inc.frozen(), 1);
         assert_eq!(inc.frozen_prefix_len(), 1);
-        // The executor-shaped call: evict before the first alive position (seq 1). Under an
-        // overlapping skip mode the matcher declines to rebase.
-        assert!(matches!(
-            inc.finalize_evicted_prefix(Seq(1)),
-            Finalized::MustRebuild
-        ));
+        // The executor-shaped call: evict before the first alive position (seq 1 == next_pos). The
+        // frozen (0,2) straddles the boundary but its start is evicted, so it is consumed and the
+        // matcher rebases in place rather than declining.
+        let removed = finalize_rebased(&mut inc, Seq(1));
+        assert_eq!(seq_triples(&removed), vec![(0, 2, labels(&["a", "a"]))]);
+        // Post-finalize: only the surviving match (1,3) remains, and it equals a fresh batch scan
+        // over the surviving rows `full[1..]` (positions shifted up by the one evicted row).
+        assert_eq!(provisional_triples(&inc), vec![(1, 3, labels(&["a", "a"]))]);
+        let fresh: Vec<(usize, usize, Vec<String>)> = batch_triples(&nfa, &skip, &rows[1..])
+            .await
+            .into_iter()
+            .map(|(s, e, ls)| (s + 1, e + 1, ls))
+            .collect();
+        assert_eq!(provisional_triples(&inc), fresh);
     }
 
-    /// The executor's alternative under the overlapping skip modes — drop the matcher at the
-    /// straddle-shaped eviction and rebuild it from the surviving rows — is oracle-correct: a FRESH
-    /// matcher fed the surviving rows equals the batch answer over them, and its union with the
-    /// evicted (already-emitted/finalized) match equals the batch answer over the full input.
+    /// Dropping the matcher and rebuilding from the surviving rows — the [`Finalized::MustRebuild`]
+    /// fallback the executor still takes when finalize declines (e.g. a whole-buffer drain, or a
+    /// WITHIN-expired boundary past the frozen prefix) — remains oracle-correct: a FRESH matcher fed
+    /// the surviving rows equals the batch answer over them, and its union with the evicted
+    /// (already-emitted/finalized) match equals the batch answer over the full input. (The specific
+    /// `TO NEXT ROW` shape here now *rebases* through the executor — see the test above — but the
+    /// rebuild path this exercises is still reached on the declined shapes and must stay sound.)
     #[tokio::test]
     async fn to_next_row_drop_and_rebuild_across_eviction_equals_batch() {
         let pat = Pattern::Concat(vec![Pattern::Var("a".into()), Pattern::Var("a".into())]);
         let nfa = Nfa::compile(&pat);
         let skip = SkipMode::ToNextRow;
 
-        // Same shape as the should_panic test above: matches (0,2) frozen, (1,3) boundary-held.
+        // Matches (0,2) frozen, (1,3) boundary-held.
         let full = from_str("aaa");
         let m_full = SetMatcher::new(full.clone());
         let mut inc = IncrementalMatcher::new(&nfa, skip.clone());
@@ -1742,10 +1772,10 @@ mod tests {
             provisional_triples(&inc),
             vec![(0, 2, labels(&["a", "a"])), (1, 3, labels(&["a", "a"]))]
         );
-        // The executor evicts rows [0..1) (position 1, the boundary-held (1,3)'s start, is the
-        // first alive position) and — because the frozen (0,2) straddles that boundary — drops the
-        // matcher instead of finalizing. The evicted (0,2) was already delivered (emitted under
-        // EOWC; pruned from the diff base without a retract under EOU).
+        // Model the drop-and-rebuild fallback directly: take the evicted match, drop the matcher,
+        // and rebuild from the surviving rows — exactly what the executor does when finalize returns
+        // `MustRebuild`. The evicted (0,2) was already delivered (emitted under EOWC; pruned from the
+        // diff base without a retract under EOU).
         let evicted = provisional_triples(&inc)[0].clone();
         drop(inc);
 
