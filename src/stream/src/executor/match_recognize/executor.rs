@@ -89,7 +89,7 @@
 //! whole-buffer barrier diffs run between the watermark evictions, so for append-mostly input the
 //! frozen prefix persists across barriers and each diff rescans only the newly-appended suffix.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map};
 use std::ops::Bound;
 
 use futures::{StreamExt, pin_mut};
@@ -1208,6 +1208,29 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                     // frontier is updated once per distinct partition (O(#partitions in chunk)) rather
                     // than once per row.
                     let mut chunk_min: HashMap<OwnedRow, Datum> = HashMap::new();
+                    // Fold the min for a *run* of consecutive same-partition rows in `run` before
+                    // touching `chunk_min`, so a partition-clustered chunk (the common shape) projects
+                    // and owns one partition key per run instead of one per row — the map's owned-key
+                    // `entry` probe is the reason the old code materialized a key for every row. The
+                    // in-run test compares the projected key by reference (no allocation); a partition
+                    // that recurs in a later run merges back into the same entry on flush, so an
+                    // unclustered chunk still owns at most one key per row, never more. `run` holds the
+                    // current `(partition_key, min_order_key)`.
+                    let mut run: Option<(OwnedRow, Datum)> = None;
+                    // Merge a finished run's min into `chunk_min`, keeping the smaller order key.
+                    let flush = |chunk_min: &mut HashMap<OwnedRow, Datum>, key: OwnedRow, min: Datum| {
+                        match chunk_min.entry(key) {
+                            hash_map::Entry::Occupied(mut e) => {
+                                if min.as_ref().unwrap().default_cmp(e.get().as_ref().unwrap()).is_lt()
+                                {
+                                    *e.get_mut() = min;
+                                }
+                            }
+                            hash_map::Entry::Vacant(e) => {
+                                e.insert(min);
+                            }
+                        }
+                    };
                     for (op, row_ref) in chunk.rows() {
                         // The input is required to be append-only (enforced at planning time), so only
                         // Insert is expected. Fail loud on anything else rather than silently
@@ -1227,20 +1250,24 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         if order_key.is_none() {
                             continue;
                         }
-                        let partition_key = row_ref.project(&partition_key_indices).to_owned_row();
-                        chunk_min
-                            .entry(partition_key)
-                            .and_modify(|m| {
-                                if order_key
-                                    .as_ref()
-                                    .unwrap()
-                                    .default_cmp(m.as_ref().unwrap())
-                                    .is_lt()
+                        // Extend the current run when this row's partition is unchanged (a by-reference
+                        // comparison over the projected partition columns — no owned row built);
+                        // otherwise flush the run and open a new one, owning the key exactly here.
+                        let projected = row_ref.project(&partition_key_indices);
+                        match &mut run {
+                            Some((key, min)) if key.iter().eq(projected.iter()) => {
+                                if order_key.as_ref().unwrap().default_cmp(min.as_ref().unwrap()).is_lt()
                                 {
-                                    *m = order_key.clone();
+                                    *min = order_key;
                                 }
-                            })
-                            .or_insert_with(|| order_key.clone());
+                            }
+                            _ => {
+                                if let Some((key, min)) = run.take() {
+                                    flush(&mut chunk_min, key, min);
+                                }
+                                run = Some((projected.to_owned_row(), order_key));
+                            }
+                        }
                         // State-table row layout: `[ seq, <input cols..> ]` — the partition columns
                         // and order key are columns of the stored input row. Written through by
                         // reference: `insert` takes `impl Row`, so the seq datum is chained onto the
@@ -1251,6 +1278,10 @@ impl<S: StateStore> MatchRecognizeExecutor<S> {
                         let seq = Seq(row_id_gen.next());
                         state_table
                             .insert(once(Some(ScalarImpl::Int64(seq.0))).chain(row_ref));
+                    }
+                    // Flush the final run into the map before the per-partition frontier update below.
+                    if let Some((key, min)) = run.take() {
+                        flush(&mut chunk_min, key, min);
                     }
                     // One frontier update per distinct partition. On insert `next_wakeup` only ever
                     // moves earlier (a new row can only make a partition need attention sooner); the
