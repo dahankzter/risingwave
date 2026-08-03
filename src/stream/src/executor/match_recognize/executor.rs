@@ -2070,7 +2070,7 @@ mod tests {
         vals.iter()
             .enumerate()
             .map(|(i, v)| BufferedRow {
-                seq: i as i64,
+                seq: Seq(i as i64),
                 order_key: Some(ScalarImpl::Int32(i as i32)),
                 row: OwnedRow::new(vec![Some(ScalarImpl::Int32(*v))]),
             })

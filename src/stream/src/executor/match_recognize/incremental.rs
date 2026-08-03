@@ -327,7 +327,11 @@ impl IncrementalMatcher {
         let mut newly_frozen = 0usize;
         let mut cursor = self.next_pos;
         'freeze: for m in &tail_abs {
-            let resume = self.skip.next_pos(m.start, m.end, &m.labels);
+            // The skip-degradation diagnostic is dropped here for the same reason
+            // `Nfa::find_matches_dynamic` drops it: this is freeze-cursor bookkeeping, not an
+            // emission site — the executor recomputes the resume position for the matches it
+            // actually emits and reports from there.
+            let (resume, _) = self.skip.next_pos(m.start, m.end, &m.labels);
             for p in cursor..resume {
                 if self.nfa.reaches_boundary_alive(p, n_rows, matcher).await? {
                     break 'freeze;
@@ -397,7 +401,9 @@ impl IncrementalMatcher {
                 break;
             }
             // `resume <= end_pos <= trunc_pos`, so every checked position is in the retained region.
-            let resume = self.skip.next_pos(start_pos, end_pos, &m.labels);
+            // Diagnostic dropped: truncation bookkeeping, not an emission site (see
+            // `Nfa::find_matches_dynamic` for the policy).
+            let (resume, _) = self.skip.next_pos(start_pos, end_pos, &m.labels);
             for p in cursor..resume {
                 if self
                     .nfa
