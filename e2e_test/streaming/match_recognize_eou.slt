@@ -194,7 +194,8 @@ select * from t_eou_i2 match_recognize (
 );
 
 # The completing rows (a@1, b@2 -- span 1, exactly the WITHIN bound) and a cross-partition sentinel
-# (id 2, ts 3) that advances the watermark to 2 -- exactly this match's WITHIN deadline (1 + 1) --
+# (id 2, ts 4) that advances the watermark to 3 -- strictly past this match's WITHIN deadline of 2
+# (1 + 1; finality is strict, a deadline AT the watermark is still open) --
 # all arrive in ONE statement, before a SINGLE flush. Within that one epoch (Chunk -> Watermark ->
 # Barrier), the match becomes watermark-safe AND is fully evicted by the watermark arm's WITHIN-final
 # boundary logic, with NO earlier barrier ever having diffed this partition (this is the first chunk
@@ -202,7 +203,7 @@ select * from t_eou_i2 match_recognize (
 # match is evicted with nothing downstream having ever seen it -- permanently lost. Assert the row IS
 # present.
 statement ok
-insert into t_eou_i2 values (1, 1, 5), (1, 2, -1), (2, 3, 0);
+insert into t_eou_i2 values (1, 1, 5), (1, 2, -1), (2, 4, 0);
 
 statement ok
 flush;

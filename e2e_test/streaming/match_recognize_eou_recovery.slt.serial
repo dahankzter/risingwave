@@ -154,15 +154,16 @@ select n, dip from mv_eou_idle_recover;
 ----
 2 -1
 
-# Sentinel (partition 9, ts 12) advances the watermark to 11 -- past BOTH of partition 1's rows, so
-# safe_len == rows.len() for it. The match is held alive (the open `b+` quantifier could still extend
+# Sentinel (partition 9, ts 13) advances the watermark to 12 -- strictly past BOTH of partition 1's
+# rows (finality is strict, so a row AT the watermark would not count), so safe_len == rows.len()
+# for it. The match is held alive (the open `b+` quantifier could still extend
 # it, so `reaches_boundary_alive` keeps its start), so nothing evicts. Its WITHIN deadline is far in
 # the future (first row ts 10 + 1000 = 1010, well past the watermark 11), so the partition sits IDLE
 # with a still-open match -- no new rows, no near-term wakeup fires -- until recovery. (Unlike the
 # no-WITHIN shape this replaced, the frontier still holds partition 1's entry, scheduled at deadline
 # 1010; the buffer-table rebuild does not rely on that, which is the point.)
 statement ok
-insert into t_eou_idle_recover values (9, 12, 0);
+insert into t_eou_idle_recover values (9, 13, 0);
 
 query II rowsort
 select n, dip from mv_eou_idle_recover;
